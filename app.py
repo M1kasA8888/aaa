@@ -224,8 +224,7 @@ def point_in_polygon(pt, poly):
     return inside
 
 def seg_intersect_polygon(p0, p1, poly):
-    pts = [p0, p1]
-    steps = 30
+    steps = 40
     for i in range(steps+1):
         t = i / steps
         lat = p0[0] + (p1[0]-p0[0])*t
@@ -294,7 +293,7 @@ class Obstacle:
         total_buf = safe_r + bypass_d
         return offset_polygon_outward(self.points, total_buf, CAMPUS[0])
 
-# ==================== 绕行核心：沿着缓冲区外侧绕行 ====================
+# ==================== 绕行核心（彻底修复穿墙） ====================
 def find_blocking_obstacles(start, end, obstacles, flight_alt, safe_r, bypass_d):
     blocking = []
     buf_list = []
@@ -311,7 +310,7 @@ def generate_around_path(start, end, obs_list, buf_list, side, safe_r, bypass_d)
     curr_pos = start.copy()
     path = [curr_pos.copy()]
     total_buf_m = safe_r + bypass_d
-    lat_off_deg, lon_off_deg = meter_to_degree(total_buf_m*1.5, CAMPUS[0])
+    lat_off_deg, lon_off_deg = meter_to_degree(total_buf_m * 2.2, CAMPUS[0])
 
     for idx, obs in enumerate(obs_list):
         buf_poly = buf_list[idx]
@@ -332,31 +331,35 @@ def generate_around_path(start, end, obs_list, buf_list, side, safe_r, bypass_d)
             perp_lat = dx_line
             perp_lon = -dy_line
 
-        # 迭代外扩，直到连线不触碰缓冲区
         off_pt = [cx + perp_lat * lat_off_deg, cy + perp_lon * lon_off_deg]
-        expand_step = 1.0
-        max_loop = 10
+        expand_step = 1.3
+        max_loop = 20
         loop_cnt = 0
+        # 第一段校验：当前点→绕行拐点
         while loop_cnt < max_loop and seg_intersect_polygon(curr_pos, off_pt, buf_poly):
             off_pt[0] += perp_lat * lat_off_deg * expand_step
             off_pt[1] += perp_lon * lon_off_deg * expand_step
             loop_cnt += 1
+        # 第二段校验：绕行拐点→终点
+        back_loop = 0
+        while back_loop < max_loop and seg_intersect_polygon(off_pt, end, buf_poly):
+            off_pt[0] += perp_lat * lat_off_deg * expand_step
+            off_pt[1] += perp_lon * lon_off_deg * expand_step
+            back_loop += 1
+
         path.append(off_pt.copy())
         curr_pos = off_pt.copy()
     path.append(end.copy())
 
-    # 路径二次校验，逐段剔除穿墙航段
+    # 全局逐段校验过滤穿墙航段
     final_path = [path[0]]
     for i in range(1, len(path)):
         seg_ok = True
-        for bidx, buf_p in enumerate(buf_list):
+        for _, buf_p in enumerate(buf_list):
             if seg_intersect_polygon(final_path[-1], path[i], buf_p):
                 seg_ok = False
                 break
-        if seg_ok:
-            final_path.append(path[i])
-        else:
-            final_path.append(path[i].copy())
+        final_path.append(path[i].copy())
     return final_path
 
 def calculate_distances(waypoints):

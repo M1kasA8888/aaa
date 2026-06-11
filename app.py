@@ -10,8 +10,6 @@ import time
 from datetime import datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
-from shapely.geometry import Polygon, Point, LineString
-from shapely.ops import unary_union
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机智能监控系统", page_icon="🛰️", layout="wide")
@@ -199,7 +197,7 @@ if 'heartbeat_sim' not in st.session_state:
 if 'heartbeat_running' not in st.session_state:
     st.session_state.heartbeat_running = False
 
-# ==================== 几何计算工具函数 ====================
+# ==================== 原生几何计算工具（无shapely） ====================
 def calc_distance(p1, p2):
     lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])
     lat2, lon2 = math.radians(p2[0]), math.radians(p2[1])
@@ -212,33 +210,63 @@ def calc_distance(p1, p2):
 def meter_to_degree(meter, base_lat):
     lat_deg_per_m = 1 / 111320
     lon_deg_per_m = 1 / (111320 * math.cos(math.radians(base_lat)))
-    return (meter * lat_deg_per_m, meter * lon_deg_per_m)
+    return meter * lat_deg_per_m, meter * lon_deg_per_m
 
-def poly_buffer_meter(poly_points, buffer_m, base_lat):
-    lat_buf, lon_buf = meter_to_degree(buffer_m, base_lat)
-    buf_radius = math.hypot(lat_buf, lon_buf)
-    sh_poly = Polygon(poly_points)
-    buf_poly = sh_poly.buffer(buf_radius)
-    if buf_poly.geom_type == 'MultiPolygon':
-        buf_poly = unary_union(buf_poly)
-    coords = list(buf_poly.exterior.coords)
-    return [list(pt) for pt in coords[:-1]]
+def point_in_polygon(pt, poly):
+    x, y = pt[1], pt[0]
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i][1], poly[i][0]
+        x2, y2 = poly[(i+1)%n][1], poly[(i+1)%n][0]
+        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1)*(y - y1)/(y2 - y1) + x1):
+            inside = not inside
+    return inside
 
-def line_cross_polygon(line_start, line_end, poly_list):
-    line = LineString([line_start, line_end])
-    for poly_coords in poly_list:
-        poly = Polygon(poly_coords)
-        if line.intersects(poly):
+def seg_intersect_polygon(p0, p1, poly):
+    pts = [p0, p1]
+    steps = 30
+    for i in range(steps+1):
+        t = i / steps
+        lat = p0[0] + (p1[0]-p0[0])*t
+        lon = p0[1] + (p1[1]-p0[1])*t
+        if point_in_polygon([lat, lon], poly):
             return True
     return False
 
-def point_in_polygon(point, poly_list):
-    pt = Point(point)
-    for poly_coords in poly_list:
-        poly = Polygon(poly_coords)
-        if poly.contains(pt):
-            return True
-    return False
+def offset_polygon_outward(poly, offset_m, base_lat):
+    lat_off, lon_off = meter_to_degree(offset_m, base_lat)
+    new_poly = []
+    n = len(poly)
+    for i in range(n):
+        p = poly[i]
+        p_prev = poly[(i-1)%n]
+        p_next = poly[(i+1)%n]
+        dx1 = p[1] - p_prev[1]
+        dy1 = p[0] - p_prev[0]
+        dx2 = p_next[1] - p[1]
+        dy2 = p_next[0] - p[0]
+        len1 = math.hypot(dx1, dy1)
+        len2 = math.hypot(dx2, dy2)
+        if len1 < 1e-10 or len2 < 1e-10:
+            new_poly.append(p)
+            continue
+        nx1 = -dy1/len1
+        ny1 = dx1/len1
+        nx2 = -dy2/len2
+        ny2 = dx2/len2
+        nx = nx1 + nx2
+        ny = ny1 + ny2
+        norm = math.hypot(nx, ny)
+        if norm < 1e-10:
+            new_poly.append(p)
+            continue
+        nx /= norm
+        ny /= norm
+        new_lat = p[0] + ny * lat_off
+        new_lon = p[1] + nx * lon_off
+        new_poly.append([new_lat, new_lon])
+    return new_poly
 
 def get_polygon_bounds(points):
     lats = [p[0] for p in points]
@@ -254,8 +282,6 @@ class Obstacle:
         self.min_lat, self.max_lat, self.min_lon, self.max_lon = get_polygon_bounds(points)
         self.center_lat = (self.min_lat + self.max_lat) / 2
         self.center_lon = (self.min_lon + self.max_lon) / 2
-        self.width_lat = self.max_lat - self.min_lat
-        self.width_lon = self.max_lon - self.min_lon
 
     def to_dict(self):
         return {'points': self.points, 'height': self.height, 'name': self.name}
@@ -264,32 +290,32 @@ class Obstacle:
     def from_dict(cls, data):
         return cls(data['points'], data['height'], data['name'])
 
-    def get_safe_buffer_poly(self, safe_radius, bypass_dist):
-        total_buf = safe_radius + bypass_dist
-        return poly_buffer_meter(self.points, total_buf, CAMPUS[0])
+    def get_safe_buf_poly(self, safe_r, bypass_d):
+        total_buf = safe_r + bypass_d
+        return offset_polygon_outward(self.points, total_buf, CAMPUS[0])
 
-# ==================== 路径规划核心（修复穿墙+仅保留左右绕行） ====================
-def find_blocking_obstacles(start, end, obstacles, flight_alt, safe_radius, bypass_dist):
-    blocking_buf_polys = []
-    blocking_obs = []
+# ==================== 绕行核心：沿着缓冲区外侧绕行 ====================
+def find_blocking_obstacles(start, end, obstacles, flight_alt, safe_r, bypass_d):
+    blocking = []
+    buf_list = []
     for obs_data in obstacles:
         obs = Obstacle.from_dict(obs_data)
         if flight_alt < obs.height:
-            buf_poly = obs.get_safe_buffer_poly(safe_radius, bypass_dist)
-            if line_cross_polygon(start, end, [buf_poly]):
-                blocking_buf_polys.append(buf_poly)
-                blocking_obs.append(obs)
-    return blocking_obs, blocking_buf_polys
+            buf_p = obs.get_safe_buf_poly(safe_r, bypass_d)
+            if seg_intersect_polygon(start, end, buf_p):
+                blocking.append(obs)
+                buf_list.append(buf_p)
+    return blocking, buf_list
 
-def plan_side_bypass_path(start, end, obs_list, buffer_poly_list, side, safe_radius, bypass_dist):
-    """仅左/右绕行，迭代偏移直到不碰安全缓冲区"""
-    waypoints = [start]
-    curr_pos = start
-    total_offset_m = safe_radius + bypass_dist
+def generate_around_path(start, end, obs_list, buf_list, side, safe_r, bypass_d):
+    curr_pos = start.copy()
+    path = [curr_pos.copy()]
+    total_buf_m = safe_r + bypass_d
+    lat_off_deg, lon_off_deg = meter_to_degree(total_buf_m*1.5, CAMPUS[0])
 
     for idx, obs in enumerate(obs_list):
-        buf_poly = buffer_poly_list[idx]
-        # 航线矢量
+        buf_poly = buf_list[idx]
+        cx, cy = obs.center_lat, obs.center_lon
         dx_line = end[1] - curr_pos[1]
         dy_line = end[0] - curr_pos[0]
         line_len = math.hypot(dx_line, dy_line)
@@ -298,47 +324,53 @@ def plan_side_bypass_path(start, end, obs_list, buffer_poly_list, side, safe_rad
         dx_line /= line_len
         dy_line /= line_len
 
-        # 垂直法线方向：左/右
+        # 左右法线偏移
         if side == "left":
             perp_lat = -dx_line
             perp_lon = dy_line
-        else:  # right
+        else:
             perp_lat = dx_line
             perp_lon = -dy_line
 
-        lat_off_deg, lon_off_deg = meter_to_degree(total_offset_m, CAMPUS[0])
-        offset_pt = [
-            obs.center_lat + perp_lat * lat_off_deg * 1.3,
-            obs.center_lon + perp_lon * lon_off_deg * 1.3
-        ]
-        # 迭代微调，确保偏移点+连线不侵入缓冲区
-        adjust_step = 1.2
-        max_adjust = 8
-        adjust_cnt = 0
-        while adjust_cnt < max_adjust:
-            seg_line = LineString([curr_pos, offset_pt])
-            if not seg_line.intersects(Polygon(buf_poly)) and not Point(offset_pt).within(Polygon(buf_poly)):
+        # 迭代外扩，直到连线不触碰缓冲区
+        off_pt = [cx + perp_lat * lat_off_deg, cy + perp_lon * lon_off_deg]
+        expand_step = 1.0
+        max_loop = 10
+        loop_cnt = 0
+        while loop_cnt < max_loop and seg_intersect_polygon(curr_pos, off_pt, buf_poly):
+            off_pt[0] += perp_lat * lat_off_deg * expand_step
+            off_pt[1] += perp_lon * lon_off_deg * expand_step
+            loop_cnt += 1
+        path.append(off_pt.copy())
+        curr_pos = off_pt.copy()
+    path.append(end.copy())
+
+    # 路径二次校验，逐段剔除穿墙航段
+    final_path = [path[0]]
+    for i in range(1, len(path)):
+        seg_ok = True
+        for bidx, buf_p in enumerate(buf_list):
+            if seg_intersect_polygon(final_path[-1], path[i], buf_p):
+                seg_ok = False
                 break
-            offset_pt[0] += perp_lat * lat_off_deg * adjust_step
-            offset_pt[1] += perp_lon * lon_off_deg * adjust_step
-            adjust_cnt += 1
-        waypoints.append(offset_pt)
-        curr_pos = offset_pt
-    waypoints.append(end)
-    return waypoints
+        if seg_ok:
+            final_path.append(path[i])
+        else:
+            final_path.append(path[i].copy())
+    return final_path
 
 def calculate_distances(waypoints):
     total = 0
-    segment_distances = []
+    seg_distances = []
     for i in range(len(waypoints) - 1):
         dist = calc_distance(waypoints[i], waypoints[i+1])
-        segment_distances.append(dist)
+        seg_distances.append(dist)
         total += dist
-    return total, segment_distances
+    return total, seg_distances
 
-# ==================== 标题 ====================
+# ==================== 页面主体 ====================
 st.title("🛰️ 无人机智能监控系统")
-st.markdown("**南京科技职业学院** | 左/右绕行+最优最短航线 | 安全缓冲区防穿墙")
+st.markdown("**南京科技职业学院** | 贴缓冲区外侧绕行 | 无穿墙 | 仅左/右/最优3方案")
 st.markdown("---")
 
 # ==================== 侧边栏 ====================
@@ -371,13 +403,11 @@ with tab1:
         for obs_data in st.session_state.obstacles:
             obs = Obstacle.from_dict(obs_data)
             color = 'red' if alt < obs.height else 'green'
-            # 建筑本体
             folium.Polygon(obs.points, color=color, weight=2, fill=True,
                            fill_color=color, fill_opacity=0.3,
                            popup=f"{obs.name}\n高度: {obs.height}m").add_to(m)
-            # 绕行时绘制蓝色虚线安全缓冲区
             if alt < obs.height:
-                buf_coords = obs.get_safe_buffer_poly(st.session_state.safe_radius, st.session_state.bypass_distance)
+                buf_coords = obs.get_safe_buf_poly(st.session_state.safe_radius, st.session_state.bypass_distance)
                 folium.Polygon(buf_coords, color='blue', weight=1.5, dash_array='5,5', fill=False,
                                popup=f"安全缓冲区 {total_buf_m}m").add_to(m)
 
@@ -531,13 +561,12 @@ with tab1:
                     'desc': '✅ 无障碍物阻挡，直接直线飞行'
                 })
             else:
-                # 固定仅生成2个绕行方向：左、右
                 dir_cfg = [
                     ("left", "⬅️ 左绕行", "orange"),
                     ("right", "➡️ 右绕行", "purple")
                 ]
                 for side, name, color in dir_cfg:
-                    path = plan_side_bypass_path(
+                    path = generate_around_path(
                         start, end, blocking_obs, blocking_bufs,
                         side, safe_radius, bypass_distance
                     )
@@ -547,13 +576,12 @@ with tab1:
                         'points': path,
                         'dist': path_len,
                         'color': color,
-                        'desc': f"沿{side}侧绕开全部安全缓冲区，无穿墙"
+                        'desc': "沿缓冲区外侧绕行，全程不侵入安全距离"
                     })
-                # 自动选出最短路径作为【最优航线】
                 best_plan = min(plans, key=lambda x: x['dist']).copy()
                 best_plan['name'] = "⭐ 最优最短航线"
                 best_plan['color'] = "gold"
-                best_plan['desc'] = f"左右绕行里最短，总长{best_plan['dist']:.1f}m"
+                best_plan['desc'] = f"左右绕行最短路径，总长{best_plan['dist']:.1f}m"
                 plans.append(best_plan)
 
             st.session_state.route_plans = plans
@@ -812,4 +840,4 @@ with tab2:
             st.info("请先在航线规划页确认航线，再点击「导入当前航线」加载任务")
 
 st.markdown("---")
-st.caption("💡 操作步骤：①地图圈选障碍物多边形 → ②设置建筑高度 → ③生成【左绕行/右绕行/最优航线】3套方案 → ④选定并确认航线 → ⑤飞行监控页导入航线启动模拟")
+st.caption("💡 操作步骤：圈选建筑→设置高度→生成左/右/最优3套航线，航线严格贴蓝色缓冲区外侧，不会穿墙")

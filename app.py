@@ -49,6 +49,8 @@ if 'flight_alt' not in st.session_state:
     st.session_state.flight_alt = 20
 if 'safe_radius' not in st.session_state:
     st.session_state.safe_radius = 5
+if 'bypass_distance' not in st.session_state:
+    st.session_state.bypass_distance = 20  # 新增：绕行距离控制（米）
 if 'route_plans' not in st.session_state:
     st.session_state.route_plans = []
 if 'selected_plan' not in st.session_state:
@@ -263,9 +265,11 @@ class Obstacle:
                 return True
         return False
     
-    def get_vertex_bypass(self, start, end, side, safe_radius=5):
-        """使用障碍物顶点进行绕行"""
-        safe_deg = safe_radius / 111000
+    def get_vertex_bypass(self, start, end, side, safe_radius=5, bypass_distance=20):
+        """使用障碍物顶点进行绕行，增加绕行距离控制"""
+        # 绕行距离 = 安全半径 + 用户设置的绕行距离
+        total_offset = safe_radius + bypass_distance
+        safe_deg = total_offset / 111000  # 转换为度数
         
         vertices = [
             [self.min_lat, self.min_lon],
@@ -297,7 +301,7 @@ class Obstacle:
         if best_vertex is None:
             best_vertex = [self.center_lat, self.center_lon]
         
-        # 计算垂直方向偏移
+        # 计算航线垂直方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         length = math.hypot(dx, dy)
@@ -312,6 +316,7 @@ class Obstacle:
             perp_x = -perp_x
             perp_y = -perp_y
         
+        # 应用绕行距离
         bypass = [
             best_vertex[0] + perp_y * safe_deg,
             best_vertex[1] + perp_x * safe_deg
@@ -335,7 +340,7 @@ def find_blocking_obstacles(start, end, obstacles, flight_alt):
                     blocking.append(obs_data)
     return blocking
 
-def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, side):
+def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, bypass_distance, side):
     """规划绕行路径"""
     waypoints = [start]
     current_start = start
@@ -352,7 +357,7 @@ def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, side):
     blocking.sort(key=dist_to_start)
     
     for obs in blocking:
-        bypass = obs.get_vertex_bypass(current_start, current_end, side, safe_radius)
+        bypass = obs.get_vertex_bypass(current_start, current_end, side, safe_radius, bypass_distance)
         waypoints.append(bypass)
         current_start = bypass
         
@@ -518,6 +523,11 @@ with tab1:
         safe_radius = st.slider("安全半径 (m)", 1, 30, st.session_state.safe_radius)
         st.session_state.safe_radius = safe_radius
         
+        # 新增：绕行距离控制
+        bypass_distance = st.slider("绕行距离 (m)", 5, 80, st.session_state.bypass_distance, 
+                                     help="无人机绕过障碍物时与障碍物的距离，越大绕得越远")
+        st.session_state.bypass_distance = bypass_distance
+        
         # 高度检测
         if st.session_state.obstacles:
             st.markdown("**📊 高度检测**")
@@ -577,13 +587,13 @@ with tab1:
                              'desc': '✅ 无障碍物'})
             else:
                 # 左绕行
-                left_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, 'left')
+                left_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, bypass_distance, 'left')
                 left_dist = sum(calc_distance(left_path[i], left_path[i+1]) for i in range(len(left_path)-1))
                 plans.append({'name': '⬅️ 左绕行', 'points': left_path, 'dist': left_dist, 
                              'color': 'orange', 'desc': f'多走{left_dist-straight_dist:.0f}m'})
                 
                 # 右绕行
-                right_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, 'right')
+                right_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, bypass_distance, 'right')
                 right_dist = sum(calc_distance(right_path[i], right_path[i+1]) for i in range(len(right_path)-1))
                 plans.append({'name': '➡️ 右绕行', 'points': right_path, 'dist': right_dist, 
                              'color': 'purple', 'desc': f'多走{right_dist-straight_dist:.0f}m'})
@@ -662,7 +672,7 @@ with tab2:
             waypoints = plan_bypass_path(
                 start, end, st.session_state.obstacles,
                 st.session_state.flight_alt, st.session_state.safe_radius,
-                'best'  # 使用最佳航线作为默认
+                st.session_state.bypass_distance, 'best'
             )
             total_dist, seg_dists = calculate_distances(waypoints)
             st.session_state.flight_sim_waypoints = waypoints
@@ -719,6 +729,7 @@ with tab2:
         st.caption(f"终点B: {st.session_state.point_b[0]:.6f}, {st.session_state.point_b[1]:.6f}")
         st.caption(f"飞行高度: {st.session_state.flight_alt} m")
         st.caption(f"安全半径: {st.session_state.safe_radius} m")
+        st.caption(f"绕行距离: {st.session_state.bypass_distance} m")
         st.caption(f"航点数量: {len(waypoints)}")
         if total_dist > 0:
             st.caption(f"总距离: {total_dist:.1f} 米")
@@ -877,4 +888,4 @@ with tab2:
             st.info("请先点击「导入当前航线」加载航线")
 
 st.markdown("---")
-st.caption("💡 **步骤**: ①画多边形 → ②设置高度 → ③生成方案 → ④切换到飞行监控 → ⑤导入航线 → ⑥开始飞行")
+st.caption("💡 **步骤**: ①画多边形 → ②设置高度和绕行距离 → ③生成方案 → ④切换到飞行监控 → ⑤导入航线 → ⑥开始飞行")

@@ -46,11 +46,11 @@ if 'point_a' not in st.session_state:
         st.session_state.point_b = [32.2344, 118.749]
 
 if 'flight_alt' not in st.session_state:
-    st.session_state.flight_alt = 20  # 飞行高度低于障碍物
+    st.session_state.flight_alt = 20
 if 'safe_radius' not in st.session_state:
     st.session_state.safe_radius = 10
 if 'bypass_distance' not in st.session_state:
-    st.session_state.bypass_distance = 25  # 绕行距离
+    st.session_state.bypass_distance = 25
 if 'route_plans' not in st.session_state:
     st.session_state.route_plans = []
 if 'selected_plan' not in st.session_state:
@@ -60,7 +60,7 @@ if 'confirmed_plan' not in st.session_state:
 if 'temp_obs' not in st.session_state:
     st.session_state.temp_obs = None
 if 'temp_height' not in st.session_state:
-    st.session_state.temp_height = 50  # 障碍物高度50m
+    st.session_state.temp_height = 50
 if 'temp_name' not in st.session_state:
     st.session_state.temp_name = "建筑物"
 if 'show_height_panel' not in st.session_state:
@@ -264,11 +264,9 @@ class Obstacle:
         return False
     
     def get_bypass_point(self, start, end, side, safe_radius=10, bypass_distance=25):
-        """获取绕行点 - 确保从旁边绕过"""
         total_offset = safe_radius + bypass_distance
         safe_deg = total_offset / 111000
         
-        # 计算航线方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         length = math.hypot(dx, dy)
@@ -276,7 +274,6 @@ class Obstacle:
             dx /= length
             dy /= length
         
-        # 垂直方向
         perp_x = -dy
         perp_y = dx
         
@@ -284,7 +281,6 @@ class Obstacle:
             perp_x = -perp_x
             perp_y = -perp_y
         
-        # 绕行点：障碍物中心 + 垂直偏移
         bypass = [
             self.center_lat + perp_y * safe_deg,
             self.center_lon + perp_x * safe_deg
@@ -308,7 +304,6 @@ def find_blocking_obstacles(start, end, obstacles, flight_alt):
     return blocking
 
 def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, bypass_distance, side):
-    """规划绕行路径 - 确保航线从旁边绕过"""
     waypoints = [start]
     current_start = start
     current_end = end
@@ -319,14 +314,11 @@ def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, bypass_dist
         waypoints.append(end)
         return waypoints
     
-    # 按距离起点排序
     def dist_to_start(obs):
         return calc_distance([obs.center_lat, obs.center_lon], start)
     blocking.sort(key=dist_to_start)
     
-    # 依次绕过每个障碍物
     for obs in blocking:
-        # 获取绕行点
         bypass = obs.get_bypass_point(current_start, current_end, side, safe_radius, bypass_distance)
         waypoints.append(bypass)
         current_start = bypass
@@ -375,7 +367,6 @@ with tab1:
                 height = obs_data.height
                 name = obs_data.name
             
-            # 红色表示需要绕行（高度低于障碍物）
             color = 'red' if alt < height else 'green'
             folium.Polygon(points, color=color, weight=2, fill=True, 
                           fill_color=color, fill_opacity=0.3,
@@ -406,7 +397,6 @@ with tab1:
                     st.success(f"✅ 已绘制 {len(pts)} 个点")
     
     with col_right:
-        # 新建障碍物
         if st.session_state.show_height_panel and st.session_state.temp_obs:
             st.markdown("### 🆕 新建3D障碍物")
             name = st.text_input("名称", value=st.session_state.temp_name)
@@ -415,7 +405,6 @@ with tab1:
             height = st.number_input("障碍物高度 (m)", value=st.session_state.temp_height, min_value=1, max_value=200, step=5)
             st.session_state.temp_height = height
             
-            # 提示当前飞行高度与障碍物的关系
             current_flight = st.session_state.flight_alt
             if current_flight < height:
                 st.warning(f"⚠️ 飞行高度 {current_flight}m < 障碍物高度 {height}m，将触发绕行")
@@ -438,7 +427,6 @@ with tab1:
                     st.rerun()
             st.markdown("---")
         
-        # 起点
         st.markdown("### 🚁 起点 A")
         col1, col2 = st.columns(2)
         with col1:
@@ -450,7 +438,6 @@ with tab1:
             save_waypoints()
             st.rerun()
         
-        # 终点
         st.markdown("### 🎯 终点 B")
         col1, col2 = st.columns(2)
         with col1:
@@ -464,23 +451,18 @@ with tab1:
         
         st.markdown("---")
         
-        # 飞行参数
         st.markdown("### ⚙️ 飞行参数")
-        alt = st.slider("飞行高度 (m)", 10, 100, st.session_state.flight_alt, 
-                         help="飞行高度低于障碍物时会自动绕行")
+        alt = st.slider("飞行高度 (m)", 10, 100, st.session_state.flight_alt)
         st.session_state.flight_alt = alt
         
-        safe_radius = st.slider("安全半径 (m)", 5, 30, st.session_state.safe_radius,
-                                 help="无人机与障碍物保持的安全距离")
+        safe_radius = st.slider("安全半径 (m)", 5, 30, st.session_state.safe_radius)
         st.session_state.safe_radius = safe_radius
         
-        bypass_distance = st.slider("绕行距离 (m)", 10, 80, st.session_state.bypass_distance,
-                                     help="绕过障碍物时的额外距离，越大绕得越远")
+        bypass_distance = st.slider("绕行距离 (m)", 10, 80, st.session_state.bypass_distance)
         st.session_state.bypass_distance = bypass_distance
         
         st.info(f"🛡️ 安全半径: {safe_radius}m | 🚀 绕行距离: {bypass_distance}m")
         
-        # 高度检测
         if st.session_state.obstacles:
             st.markdown("**📊 高度检测**")
             for obs_data in st.session_state.obstacles:
@@ -493,7 +475,6 @@ with tab1:
         
         st.markdown("---")
         
-        # 障碍物列表
         st.markdown("### 🚧 障碍物列表")
         for i, obs_data in enumerate(st.session_state.obstacles):
             name = obs_data['name'] if isinstance(obs_data, dict) else obs_data.name
@@ -523,13 +504,11 @@ with tab1:
         st.markdown("---")
         st.markdown("## 🗺️ 多航线规划")
         
-        # 生成航线方案
         if st.button("🎯 生成航线方案", use_container_width=True, type="primary"):
             start = st.session_state.point_a
             end = st.session_state.point_b
             straight_dist = calc_distance(start, end)
             
-            # 检查是否需要绕行
             blocking = find_blocking_obstacles(start, end, st.session_state.obstacles, alt)
             
             plans = []
@@ -539,30 +518,26 @@ with tab1:
                              'dist': straight_dist, 'color': 'blue', 
                              'desc': '✅ 无障碍物阻挡'})
             else:
-                # 左绕行
                 left_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, bypass_distance, 'left')
                 left_dist = sum(calc_distance(left_path[i], left_path[i+1]) for i in range(len(left_path)-1))
                 plans.append({'name': '⬅️ 左绕行', 'points': left_path, 'dist': left_dist, 
                              'color': 'orange', 'desc': f'从左侧绕过障碍物'})
                 
-                # 右绕行
                 right_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, bypass_distance, 'right')
                 right_dist = sum(calc_distance(right_path[i], right_path[i+1]) for i in range(len(right_path)-1))
                 plans.append({'name': '➡️ 右绕行', 'points': right_path, 'dist': right_dist, 
                              'color': 'purple', 'desc': f'从右侧绕过障碍物'})
                 
-                # 最佳航线（取距离短的）
                 best = min(plans, key=lambda x: x['dist']).copy()
                 best['name'] = '⭐ 最佳航线'
                 best['color'] = 'gold'
-                best['desc'] = f'最优路径，比另一方案省{abs(left_dist - right_dist):.0f}m'
+                best['desc'] = f'最优路径，省{abs(left_dist - right_dist):.0f}m'
                 plans.append(best)
             
             st.session_state.route_plans = plans
             st.session_state.selected_plan = plans[-1]
             st.rerun()
         
-        # 显示方案
         if st.session_state.route_plans:
             st.markdown("---")
             st.markdown("### 📋 可选方案")
@@ -736,4 +711,93 @@ with tab2:
                 st.session_state.flight_sim_current_index = current_index
                 
                 p1 = waypoints[current_index]
-                p2_index = min(current_index
+                p2_index = min(current_index + 1, len(waypoints) - 1)
+                p2 = waypoints[p2_index]
+                current_lng = p1[0] + (p2[0] - p1[0]) * segment_progress
+                current_lat = p1[1] + (p2[1] - p1[1]) * segment_progress
+                
+                remaining_distance = max(0, total_dist - flown_distance)
+                remaining_time = remaining_distance / current_speed if current_speed > 0 else 0
+                
+                minutes = int(elapsed_time // 60)
+                seconds = int(elapsed_time % 60)
+                elapsed_str = f"{minutes:02d}:{seconds:02d}"
+                
+                rem_minutes = int(remaining_time // 60)
+                rem_seconds = int(remaining_time % 60)
+                remaining_str = f"{rem_minutes:02d}:{rem_seconds:02d}"
+                
+                battery_remaining = max(0, 100 - (elapsed_time / 1800) * 100)
+                
+                if current_index > st.session_state.flight_sim_last_wp_index:
+                    st.session_state.flight_sim_last_wp_index = current_index
+                    add_fcu_to_gcs_log(f"FCU→OBC→GCS: WP_REACHED #{current_index}")
+                    if current_index >= len(waypoints) - 1:
+                        add_fcu_to_gcs_log("FCU→OBC→GCS: MISSION_COMPLETE")
+                        add_business_log("任务执行完成", color="green")
+            else:
+                current_lng = waypoints[0][0]
+                current_lat = waypoints[0][1]
+                flown_distance = 0
+                remaining_distance = total_dist
+                elapsed_str = "00:00"
+                remaining_str = "00:00"
+                battery_remaining = 100
+                current_index = 0
+            
+            st.markdown("### 📊 飞行数据")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("当前航点", f"{min(current_index + 1, len(waypoints))}/{len(waypoints)}")
+            col2.metric("飞行速度", f"{st.session_state.flight_sim_speed:.1f} m/s")
+            col3.metric("已用时间", elapsed_str)
+            col4.metric("剩余距离", f"{remaining_distance:.0f} m")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("预计到达", remaining_str)
+            col2.metric("电量模拟", f"{battery_remaining:.0f}%")
+            col3.metric("完成进度", f"{(flown_distance/total_dist*100) if total_dist > 0 else 0:.0f}%")
+            
+            if total_dist > 0:
+                st.progress(min(1.0, flown_distance / total_dist))
+            
+            st.markdown("---")
+            st.markdown("### 📶 通信链路拓扑")
+            
+            col_gcs, col_obc, col_fcu = st.columns(3)
+            with col_gcs:
+                st.success("✅ GCS 在线")
+            with col_obc:
+                st.success("✅ OBC 在线")
+            with col_fcu:
+                st.success("✅ FCU 在线")
+            
+            st.markdown("---")
+            
+            if st.session_state.flight_sim_running:
+                st.info("✈️ 任务执行中...")
+            elif current_index >= len(waypoints) - 1 and len(waypoints) > 0:
+                st.success("✅ 任务已完成！")
+            else:
+                st.info("⏸️ 等待开始")
+            
+            st.markdown("---")
+            st.markdown("### 📝 通信日志")
+            
+            log_container = st.container(height=200)
+            with log_container:
+                for log in st.session_state.comm_logs_business[-10:]:
+                    st.caption(f"📋 [{log['timestamp']}] {log['message']}")
+                for log in st.session_state.comm_logs_fcu_to_gcs[-5:]:
+                    st.caption(f"⬆️ {log}")
+                for log in st.session_state.comm_logs_gcs_to_fcu[-5:]:
+                    st.caption(f"⬇️ {log}")
+            
+            if st.session_state.flight_sim_running:
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.info("请先点击「导入当前航线」加载航线")
+
+st.markdown("---")
+st.caption("💡 **步骤**: ①画多边形 → ②设置高度和绕行距离 → ③生成方案 → ④切换到飞行监控 → ⑤导入航线 → ⑥开始飞行")

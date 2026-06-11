@@ -50,7 +50,7 @@ if 'flight_alt' not in st.session_state:
 if 'safe_radius' not in st.session_state:
     st.session_state.safe_radius = 10
 if 'bypass_distance' not in st.session_state:
-    st.session_state.bypass_distance = 25
+    st.session_state.bypass_distance = 15
 if 'route_plans' not in st.session_state:
     st.session_state.route_plans = []
 if 'selected_plan' not in st.session_state:
@@ -263,10 +263,12 @@ class Obstacle:
                 return True
         return False
     
-    def get_bypass_point(self, start, end, side, safe_radius=10, bypass_distance=25):
+    def get_all_bypass_points(self, start, end, safe_radius=10, bypass_distance=15):
+        """获取多个绕行点：左、右、前、后"""
         total_offset = safe_radius + bypass_distance
         safe_deg = total_offset / 111000
         
+        # 计算航线方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         length = math.hypot(dx, dy)
@@ -274,19 +276,22 @@ class Obstacle:
             dx /= length
             dy /= length
         
+        # 垂直方向（左右）
         perp_x = -dy
         perp_y = dx
         
-        if side == 'right':
-            perp_x = -perp_x
-            perp_y = -perp_y
+        # 水平方向（前后）
+        along_x = dx
+        along_y = dy
         
-        bypass = [
-            self.center_lat + perp_y * safe_deg,
-            self.center_lon + perp_x * safe_deg
-        ]
+        points = {
+            'left': [self.center_lat + perp_y * safe_deg, self.center_lon + perp_x * safe_deg],
+            'right': [self.center_lat - perp_y * safe_deg, self.center_lon - perp_x * safe_deg],
+            'front': [self.center_lat + along_y * safe_deg * 1.5, self.center_lon + along_x * safe_deg * 1.5],
+            'back': [self.center_lat - along_y * safe_deg * 1.5, self.center_lon - along_x * safe_deg * 1.5]
+        }
         
-        return bypass
+        return points
 
 # ==================== 路径规划 ====================
 def find_blocking_obstacles(start, end, obstacles, flight_alt):
@@ -303,7 +308,8 @@ def find_blocking_obstacles(start, end, obstacles, flight_alt):
                     blocking.append(obs_data)
     return blocking
 
-def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, bypass_distance, side):
+def plan_path_with_bypass(start, end, obstacles, flight_alt, safe_radius, bypass_distance, side):
+    """规划绕行路径"""
     waypoints = [start]
     current_start = start
     current_end = end
@@ -319,7 +325,11 @@ def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, bypass_dist
     blocking.sort(key=dist_to_start)
     
     for obs in blocking:
-        bypass = obs.get_bypass_point(current_start, current_end, side, safe_radius, bypass_distance)
+        all_points = obs.get_all_bypass_points(current_start, current_end, safe_radius, bypass_distance)
+        if side in all_points:
+            bypass = all_points[side]
+        else:
+            bypass = all_points['left']
         waypoints.append(bypass)
         current_start = bypass
     
@@ -328,7 +338,7 @@ def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, bypass_dist
 
 # ==================== 标题 ====================
 st.title("🛰️ 无人机智能监控系统")
-st.markdown("**南京科技职业学院** | 低于障碍物时自动绕行 | 多航线选择")
+st.markdown("**南京科技职业学院** | 多方向绕行（左/右/前/后） | 自动选择最短路径")
 st.markdown("---")
 
 # ==================== 侧边栏 ====================
@@ -370,7 +380,7 @@ with tab1:
             color = 'red' if alt < height else 'green'
             folium.Polygon(points, color=color, weight=2, fill=True, 
                           fill_color=color, fill_opacity=0.3,
-                          popup=f"{name}\n高度: {height}m\n飞行高度: {alt}m").add_to(m)
+                          popup=f"{name}\n高度: {height}m").add_to(m)
         
         folium.Marker(st.session_state.point_a, popup="🚁 起点A", icon=folium.Icon(color='green')).add_to(m)
         folium.Marker(st.session_state.point_b, popup="🎯 终点B", icon=folium.Icon(color='red')).add_to(m)
@@ -458,7 +468,7 @@ with tab1:
         safe_radius = st.slider("安全半径 (m)", 5, 30, st.session_state.safe_radius)
         st.session_state.safe_radius = safe_radius
         
-        bypass_distance = st.slider("绕行距离 (m)", 10, 80, st.session_state.bypass_distance)
+        bypass_distance = st.slider("绕行距离 (m)", 5, 50, st.session_state.bypass_distance)
         st.session_state.bypass_distance = bypass_distance
         
         st.info(f"🛡️ 安全半径: {safe_radius}m | 🚀 绕行距离: {bypass_distance}m")
@@ -518,20 +528,29 @@ with tab1:
                              'dist': straight_dist, 'color': 'blue', 
                              'desc': '✅ 无障碍物阻挡'})
             else:
-                left_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, bypass_distance, 'left')
-                left_dist = sum(calc_distance(left_path[i], left_path[i+1]) for i in range(len(left_path)-1))
-                plans.append({'name': '⬅️ 左绕行', 'points': left_path, 'dist': left_dist, 
-                             'color': 'orange', 'desc': f'从左侧绕过障碍物'})
+                # 四个方向的绕行方案
+                directions = ['left', 'right', 'front', 'back']
+                dir_names = {'left': '⬅️ 左绕行', 'right': '➡️ 右绕行', 
+                            'front': '⬆️ 前绕行', 'back': '⬇️ 后绕行'}
+                dir_colors = {'left': 'orange', 'right': 'purple', 
+                             'front': 'cyan', 'back': 'pink'}
                 
-                right_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, bypass_distance, 'right')
-                right_dist = sum(calc_distance(right_path[i], right_path[i+1]) for i in range(len(right_path)-1))
-                plans.append({'name': '➡️ 右绕行', 'points': right_path, 'dist': right_dist, 
-                             'color': 'purple', 'desc': f'从右侧绕过障碍物'})
+                for direction in directions:
+                    path = plan_path_with_bypass(start, end, st.session_state.obstacles, alt, safe_radius, bypass_distance, direction)
+                    path_dist = sum(calc_distance(path[i], path[i+1]) for i in range(len(path)-1))
+                    plans.append({
+                        'name': dir_names[direction],
+                        'points': path,
+                        'dist': path_dist,
+                        'color': dir_colors[direction],
+                        'desc': f'从{direction}侧绕过'
+                    })
                 
+                # 找出最短路径作为最佳航线
                 best = min(plans, key=lambda x: x['dist']).copy()
                 best['name'] = '⭐ 最佳航线'
                 best['color'] = 'gold'
-                best['desc'] = f'最优路径，省{abs(left_dist - right_dist):.0f}m'
+                best['desc'] = f'最短路径，距离{best["dist"]:.0f}m'
                 plans.append(best)
             
             st.session_state.route_plans = plans
@@ -549,6 +568,10 @@ with tab1:
                         st.markdown(f"**🟠 {p['name']}**")
                     elif "右绕行" in p['name']:
                         st.markdown(f"**🟣 {p['name']}**")
+                    elif "前绕行" in p['name']:
+                        st.markdown(f"**🔵 {p['name']}**")
+                    elif "后绕行" in p['name']:
+                        st.markdown(f"**🟤 {p['name']}**")
                     elif "最佳" in p['name']:
                         st.markdown(f"**⭐ {p['name']}**")
                     else:
@@ -596,7 +619,7 @@ with tab2:
         if st.button("📐 导入当前航线", use_container_width=True):
             start = st.session_state.point_a
             end = st.session_state.point_b
-            waypoints = plan_bypass_path(
+            waypoints = plan_path_with_bypass(
                 start, end, st.session_state.obstacles,
                 st.session_state.flight_alt, st.session_state.safe_radius,
                 st.session_state.bypass_distance, 'best'

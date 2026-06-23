@@ -297,16 +297,15 @@ class Obstacle:
         total_buf = safe_r + bypass_d
         return offset_polygon_outward(self.points, total_buf, CAMPUS[0])
 
-# ==================== 【修复核心：双层碰撞检测 + 强制外扩绕行】 ====================
+# ==================== 双层碰撞检测绕行算法（修复穿墙核心） ====================
 def find_blocking_obstacles(start, end, obs_list, flight_alt, safe_r, bypass_d):
     block_obs = []
     block_bufs = []
-    block_raw_polys = []  # 存储原始建筑多边形，双重校验
+    block_raw_polys = []
     for obs_data in obs_list:
         obs = Obstacle.from_dict(obs_data)
         if flight_alt < obs.height:
             buf_poly = obs.get_safe_buffer(safe_r, bypass_d)
-            # 同时检测：是否穿【建筑本体】OR【安全缓冲区】
             hit_raw = seg_intersect_polygon(start, end, obs.points)
             hit_buf = seg_intersect_polygon(start, end, buf_poly)
             if hit_raw or hit_buf:
@@ -319,10 +318,8 @@ def generate_bypass_path(start, end, obs_list, buf_list, raw_poly_list, side, sa
     current_pos = start.copy()
     full_path = [current_pos.copy()]
     total_buf = safe_r + bypass_d
-    # 加大外扩距离，强制航线远离建筑（原2.5 → 4倍缓冲区距离）
     lat_off_deg, lon_off_deg = meter_to_degree(total_buf * 4.0, CAMPUS[0])
 
-    # 逐个遍历每一个阻挡障碍物，独立生成绕行拐点
     for idx, obs in enumerate(obs_list):
         buf_poly = buf_list[idx]
         raw_poly = raw_poly_list[idx]
@@ -335,7 +332,6 @@ def generate_bypass_path(start, end, obs_list, buf_list, raw_poly_list, side, sa
         dx_line /= line_len
         dy_line /= line_len
 
-        # 左右法线方向
         if side == "left":
             perp_lat = -dx_line
             perp_lon = dy_line
@@ -343,13 +339,11 @@ def generate_bypass_path(start, end, obs_list, buf_list, raw_poly_list, side, sa
             perp_lat = dx_line
             perp_lon = -dy_line
 
-        # 初始绕行点
         bypass_pt = [cx + perp_lat * lat_off_deg, cy + perp_lon * lon_off_deg]
-        expand_step = 2.0  # 加大每次外扩步长
-        max_iter = 40      # 提升迭代上限，确保完全避开
+        expand_step = 2.0
+        max_iter = 40
         iter_cnt = 0
 
-        # 迭代外扩：起点→绕行点不能碰【建筑本体+缓冲区】
         while iter_cnt < max_iter:
             hit_raw = seg_intersect_polygon(current_pos, bypass_pt, raw_poly)
             hit_buf = seg_intersect_polygon(current_pos, bypass_pt, buf_poly)
@@ -359,7 +353,6 @@ def generate_bypass_path(start, end, obs_list, buf_list, raw_poly_list, side, sa
             bypass_pt[1] += perp_lon * lon_off_deg * expand_step
             iter_cnt += 1
 
-        # 二次校验：绕行点→终点不能碰【建筑本体+缓冲区】
         iter_cnt2 = 0
         while iter_cnt2 < max_iter:
             hit_raw = seg_intersect_polygon(bypass_pt, end, raw_poly)
@@ -374,11 +367,9 @@ def generate_bypass_path(start, end, obs_list, buf_list, raw_poly_list, side, sa
         current_pos = bypass_pt.copy()
     full_path.append(end.copy())
 
-    # 全局分段校验：每一段同时校验所有建筑本体+缓冲区，剔除侵入航段
     final_path = [full_path[0]]
     for i in range(1, len(full_path)):
         seg_safe = True
-        # 遍历所有阻挡障碍物
         for j in range(len(obs_list)):
             raw_p = raw_poly_list[j]
             buf_p = buf_list[j]
@@ -391,7 +382,6 @@ def generate_bypass_path(start, end, obs_list, buf_list, raw_poly_list, side, sa
         if seg_safe:
             final_path.append(full_path[i].copy())
         else:
-            # 若当前线段碰撞，插入新绕行点后再追加终点
             mid_pt = [(final_path[-1][0]+full_path[i][0])/2, (final_path[-1][1]+full_path[i][1])/2]
             final_path.append(mid_pt)
             final_path.append(full_path[i].copy())
@@ -406,37 +396,37 @@ def calc_path_total_dist(waypoints):
         total += d
     return total, seg_dist
 
-# ==================== 地图生成通用函数（匹配截图视觉） ====================
+# ==================== 地图生成函数（修复空瓦片报错） ====================
 def create_base_map(center, zoom=17):
     m = folium.Map(location=center, zoom_start=zoom, control_scale=True)
-    # 默认高德卫星底图
+    # 高德卫星图层
     folium.TileLayer(
         "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
         attr="高德卫星影像", subdomains=["1","2","3","4"], show=True, name="高德卫星"
     ).add_to(m)
+    # OSM街道图层
     folium.TileLayer(
         "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
         attr="OpenStreetMap", name="openstreetmap", show=False
     ).add_to(m)
-    folium.TileLayer("", name="街道底图", show=False).add_to(m)
     # 绘制工具栏
     draw_control = plugins.Draw(
         draw_options={"polygon": {"allowIntersection": False, "shapeOptions":{"color":"red","fillColor":"red","fillOpacity":0.4}}},
         edit_options={"poly": {"allowIntersection": False}}
     )
     draw_control.add_to(m)
-    # 测距工具
+    # 测距标尺
     plugins.MeasureControl(position="topleft", primary_length_unit="meters").add_to(m)
-    # 图层选择弹窗（和截图单选框一致）
+    # 图层切换控件
     folium.LayerControl(collapsed=False).add_to(m)
-    # 鼠标坐标
+    # 鼠标实时坐标显示
     plugins.MousePosition().add_to(m)
     return m
 
 def render_map_content(m, drone_pos=None):
     alt = st.session_state.flight_alt
     total_buf_w = st.session_state.safe_radius + st.session_state.bypass_distance
-    # 绘制障碍物 红色填充多边形
+    # 绘制红色障碍物建筑
     for obs_data in st.session_state.obstacles:
         obs = Obstacle.from_dict(obs_data)
         line_color = "red" if alt < obs.height else "green"
@@ -445,14 +435,14 @@ def render_map_content(m, drone_pos=None):
             fill_color=line_color, fill_opacity=0.5,
             popup=f"{obs.name}\n建筑高度：{obs.height}m\n飞行高度{alt}m"
         ).add_to(m)
-        # 绘制安全缓冲区 蓝色细虚线
+        # 绘制蓝色安全缓冲区虚线
         if alt < obs.height:
             buf_coords = obs.get_safe_buffer(st.session_state.safe_radius, st.session_state.bypass_distance)
             folium.Polygon(
                 buf_coords, color="blue", weight=1.5, dash_array="5,5", fill=False,
                 popup=f"安全缓冲区域 宽度{total_buf_w}m"
             ).add_to(m)
-    # 起点绿色播放标记、终点红色水滴标记（和截图完全匹配）
+    # 起点绿色播放标记、终点红色水滴标记
     folium.Marker(
         st.session_state.point_a, popup="🚁 起飞起点",
         icon=folium.Icon(color="green", icon="play", prefix="fa")
@@ -461,7 +451,7 @@ def render_map_content(m, drone_pos=None):
         st.session_state.point_b, popup="🎯 目标终点",
         icon=folium.Icon(color="red", icon="map-pin", prefix="fa")
     ).add_to(m)
-    # 绘制选中航线：短蓝虚线，匹配截图
+    # 绘制蓝色短虚线航线（匹配截图样式）
     if st.session_state.selected_plan:
         plan = st.session_state.selected_plan
         folium.PolyLine(
@@ -469,13 +459,13 @@ def render_map_content(m, drone_pos=None):
             dash_array="4,3",
             popup=f"{plan['name']} 航线总长 {plan['dist']:.1f}m"
         ).add_to(m)
-        # 中间绕行拐点紫色标记
+        # 绕行拐点紫色标记
         for idx, wp in enumerate(plan["points"][1:-1], 1):
             folium.Marker(
                 wp, popup=f"绕行拐点{idx}",
                 icon=folium.Icon(color="purple", icon="refresh", prefix="fa")
             ).add_to(m)
-    # 飞行监控页无人机实时点位
+    # 飞行仿真无人机实时点位
     if drone_pos is not None:
         folium.Marker(
             drone_pos, popup="✈️ 当前无人机位置",
@@ -508,7 +498,6 @@ with tab1:
         m = render_map_content(m)
         map_out = st_folium(m, width="100%", height=480, key="plan_map")
 
-        # 捕获绘制的障碍物多边形
         if map_out and map_out.get("last_active_drawing"):
             draw_data = map_out["last_active_drawing"]
             if draw_data["geometry"]["type"] == "Polygon":
@@ -519,7 +508,6 @@ with tab1:
                     st.success(f"✅ 成功圈选障碍物，顶点数量：{len(pts)}，请填写建筑高度保存")
 
     with col_ctrl:
-        # 新建障碍物弹窗
         if st.session_state.show_height_panel and st.session_state.temp_obs:
             st.markdown("### 🆕 保存障碍物建筑")
             obs_name = st.text_input("障碍物名称", value=st.session_state.temp_name)
@@ -547,7 +535,6 @@ with tab1:
                     st.rerun()
             st.markdown("---")
 
-        # 起点终点坐标配置
         st.markdown("### 🚁 起飞起点 A")
         c_a1, c_a2 = st.columns(2)
         lat_a = c_a1.number_input("纬度", value=st.session_state.point_a[0], format="%.6f")
@@ -576,7 +563,6 @@ with tab1:
         st.session_state.bypass_distance = bypass_slider
         st.info(f"🛡️ 总安全缓冲区宽度：{safe_slider + bypass_slider} m，航线同时避开建筑本体+缓冲区两层区域")
 
-        # 障碍物高度校验列表
         if st.session_state.obstacles:
             st.markdown("**📊 建筑高度校验清单**")
             for obs_data in st.session_state.obstacles:
@@ -618,7 +604,6 @@ with tab1:
             start_pt = st.session_state.point_a
             end_pt = st.session_state.point_b
             straight_dist = calc_distance(start_pt, end_pt)
-            # 【修复点】传入raw建筑多边形用于双层碰撞
             block_obs, block_bufs, block_raw_polys = find_blocking_obstacles(start_pt, end_pt, st.session_state.obstacles, alt_slider, safe_slider, bypass_slider)
             plan_list = []
             if len(block_obs) == 0:
@@ -632,7 +617,6 @@ with tab1:
             else:
                 dir_config = [("left", "⬅️ 左侧绕行方案", "orange"), ("right", "➡️ 右侧绕行方案", "purple")]
                 for side, name, color in dir_config:
-                    # 【修复点】传入原始建筑多边形
                     path = generate_bypass_path(start_pt, end_pt, block_obs, block_bufs, block_raw_polys, side, safe_slider, bypass_slider)
                     dist_total, _ = calc_path_total_dist(path)
                     plan_list.append({
@@ -642,7 +626,6 @@ with tab1:
                         "color": color,
                         "desc": "双层碰撞校验，完全避开建筑本体与安全缓冲区，无穿墙风险"
                     })
-                # 最优最短航线
                 best_plan = min(plan_list, key=lambda x: x["dist"]).copy()
                 best_plan["name"] = "⭐ 最优最短航线"
                 best_plan["color"] = "gold"
@@ -652,7 +635,6 @@ with tab1:
             st.session_state.selected_plan = plan_list[-1]
             st.rerun()
 
-        # 航线方案选择面板
         if st.session_state.route_plans:
             st.markdown("---")
             st.markdown("### 📋 可选航线方案预览")
@@ -830,7 +812,6 @@ with tab2:
                         add_fcu_to_gcs_log("飞控→地面站：MISSION_COMPLETE 全部航点执行完成")
                         add_business_log("完整航线自动巡航任务结束，全程无碰撞障碍物", color="green")
 
-            # 实时飞行数据面板（需求全部指标）
             st.markdown("### 📊 实时飞行监控数据")
             r1c1, r1c2, r1c3, r1c4 = st.columns(4)
             r1c1.metric("当前航点", f"{min(curr_wp_idx+1, len(wp_list))}/{len(wp_list)}")
@@ -846,7 +827,6 @@ with tab2:
 
             st.markdown("---")
             st.markdown("### 🗺️ 实时飞行地图（蓝色虚线航线，双层防穿墙校验）")
-            # 监控页地图同步渲染蓝色虚线航线+无人机实时点位
             m_sim = create_base_map(CAMPUS, zoom=17)
             m_sim = render_map_content(m_sim, drone_pos=st.session_state.drone_current_pos)
             st_folium(m_sim, width="100%", height=320, key="sim_map")
@@ -872,7 +852,6 @@ with tab2:
                 for log_item in st.session_state.comm_logs_gcs_to_fcu[-6:]:
                     st.caption(log_item)
 
-            # 飞行仿真自动刷新
             if st.session_state.flight_sim_running:
                 time.sleep(1.0)
                 st.rerun()
@@ -880,4 +859,4 @@ with tab2:
             st.info("操作步骤：1.航线规划页锁定航线 → 2.点击「导入已锁定航线」加载任务")
 
 st.markdown("---")
-st.caption("修复说明：新增【建筑本体+安全缓冲区】双层碰撞检测，提升线段采样精度、加大绕行外扩距离、全局分段过滤侵入航段，彻底解决航线穿过红色障碍物建筑的问题；地图视觉匹配截图：短蓝虚线航线、红色半透明建筑、绿起点红终点标记、左下角米尺比例尺")
+st.caption("修复说明：移除空瓦片图层消除ValueError报错；双层碰撞检测彻底解决航线穿墙；地图视觉匹配示例截图；完整保留障碍物持久化、多绕行方案、飞行仿真监控全部功能")

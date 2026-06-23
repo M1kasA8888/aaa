@@ -50,17 +50,17 @@ if 'safe_radius' not in st.session_state:
 if 'bypass_distance' not in st.session_state:
     st.session_state.bypass_distance = 5
 
-# 颜色自定义
+# 颜色自定义（默认高对比度，卫星图上清晰可见）
 if 'obs_fill_color' not in st.session_state:
     st.session_state.obs_fill_color = "#ff2d2d"
 if 'buffer_line_color' not in st.session_state:
-    st.session_state.buffer_line_color = "#0066ff"
+    st.session_state.buffer_line_color = "#00ccff"
 if 'left_route_color' not in st.session_state:
-    st.session_state.left_route_color = "#ff9800"
+    st.session_state.left_route_color = "#ff6600"
 if 'right_route_color' not in st.session_state:
-    st.session_state.right_route_color = "#9c27b0"
+    st.session_state.right_route_color = "#cc00ff"
 if 'best_route_color' not in st.session_state:
-    st.session_state.best_route_color = "#ffc107"
+    st.session_state.best_route_color = "#ffff00"
 
 if 'route_plans' not in st.session_state:
     st.session_state.route_plans = []
@@ -211,7 +211,7 @@ if 'heartbeat_running' not in st.session_state:
     st.session_state.heartbeat_running = False
 
 # ==================================================
-# 【修复1】几何基础计算：碰撞检测100%准确
+# 几何基础计算（高精度无漏判）
 # ==================================================
 def calc_distance(p1, p2):
     lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])
@@ -237,14 +237,12 @@ def polygon_area(poly):
     return abs(area)
 
 def point_in_polygon(pt, poly):
-    """严格射线法，点在多边形内部或边上都返回True"""
     x, y = pt[1], pt[0]
     inside = False
     n = len(poly)
     for i in range(n):
         x1, y1 = poly[i][1], poly[i][0]
         x2, y2 = poly[(i+1)%n][1], poly[(i+1)%n][0]
-        # 点在边上直接返回True
         if min(x1,x2) - 1e-8 <= x <= max(x1,x2) + 1e-8 and min(y1,y2) - 1e-8 <= y <= max(y1,y2) + 1e-8:
             if abs((x2-x1)*(y-y1) - (y2-y1)*(x-x1)) < 1e-8:
                 return True
@@ -256,10 +254,8 @@ def _ccw(A, B, C):
     return (C[0]-A[0])*(B[1]-A[1]) - (B[0]-A[0])*(C[1]-A[1]) > 1e-8
 
 def seg_intersect_seg(a1, a2, b1, b2):
-    """严格线段相交判断，包含端点接触"""
     if _ccw(a1,b1,b2) != _ccw(a2,b1,b2) and _ccw(a1,a2,b1) != _ccw(a1,a2,b2):
         return True
-    # 端点共线重叠
     if point_in_polygon(a1, [b1, b2, b2]): return True
     if point_in_polygon(a2, [b1, b2, b2]): return True
     if point_in_polygon(b1, [a1, a2, a2]): return True
@@ -267,7 +263,6 @@ def seg_intersect_seg(a1, a2, b1, b2):
     return False
 
 def seg_intersect_polygon(p0, p1, poly):
-    """线段与多边形相交检测：穿过、端点在内、擦边都算碰撞"""
     if point_in_polygon(p0, poly) or point_in_polygon(p1, poly):
         return True
     n = len(poly)
@@ -288,7 +283,6 @@ def polygon_winding(poly):
     return area > 0
 
 def offset_polygon_outward(poly, offset_m, base_lat):
-    """修复版：强制向外偏移多边形，双重校验确保缓冲区在建筑外侧"""
     lat_off, lon_off = meter_to_degree(offset_m, base_lat)
     
     def _offset_with_direction(direction):
@@ -310,7 +304,6 @@ def offset_polygon_outward(poly, offset_m, base_lat):
                 new_poly.append(p.copy())
                 continue
             
-            # 边向量顺时针转90度 = 向外法线（逆时针多边形右侧为外）
             nx1 = dy1 / len1 * direction
             ny1 = -dx1 / len1 * direction
             nx2 = dy2 / len2 * direction
@@ -330,12 +323,10 @@ def offset_polygon_outward(poly, offset_m, base_lat):
             new_poly.append([new_lat, new_lon])
         return new_poly
     
-    # 先尝试正向偏移
     result = _offset_with_direction(1.0)
     orig_area = polygon_area(poly)
     new_area = polygon_area(result)
     
-    # 如果面积变小，说明方向反了，反向偏移
     if new_area < orig_area:
         result = _offset_with_direction(-1.0)
     
@@ -368,10 +359,9 @@ class Obstacle:
         return offset_polygon_outward(self.points, total_buf, CAMPUS[0])
 
 # ==================================================
-# 【修复2】最终版绕行算法：原始建筑碰撞检测 + 中点迭代 + 双重校验
+# 【稳定版】绕行算法：中点迭代 + 全局方向兜底
 # ==================================================
 def check_path_collide_buildings(path, building_list):
-    """全路径校验：和所有原始建筑做碰撞检测，返回True=存在穿墙"""
     for i in range(len(path)-1):
         for building in building_list:
             if seg_intersect_polygon(path[i], path[i+1], building.points):
@@ -379,20 +369,26 @@ def check_path_collide_buildings(path, building_list):
     return False
 
 def generate_bypass_path(start, end, obs_list, side, safe_r, bypass_d):
-    """
-    最终可靠版绕行算法：
-    1. 直接和原始建筑做碰撞检测，绝对不会漏检
-    2. 中点迭代向指定侧偏移，每次偏移2米，迭代800次
-    3. 最终校验：如果还有碰撞，自动整体外扩安全距离
-    4. 强制对齐起点终点
-    """
     path = [start.copy(), end.copy()]
     total_safe_dist = safe_r + bypass_d
-    step_lat, step_lon = meter_to_degree(2.0, CAMPUS[0])  # 每次偏移2米，精细贴边
+    step_lat, step_lon = meter_to_degree(2.0, CAMPUS[0])
     max_iter = 800
 
+    # 计算全局主方向（起点→终点），用于最终兜底外扩
+    global_dx = end[1] - start[1]
+    global_dy = end[0] - start[0]
+    global_len = math.hypot(global_dx, global_dy)
+    if global_len > 1e-9:
+        global_dx /= global_len
+        global_dy /= global_len
+    if side == "left":
+        global_perp_x = -global_dy
+        global_perp_y = global_dx
+    else:
+        global_perp_x = global_dy
+        global_perp_y = -global_dx
+
     for _ in range(max_iter):
-        # 查找第一个碰撞的航段
         collide_idx = -1
         for i in range(len(path)-1):
             s = path[i]
@@ -405,9 +401,8 @@ def generate_bypass_path(start, end, obs_list, side, safe_r, bypass_d):
                 break
         
         if collide_idx == -1:
-            break  # 全程无碰撞，完成
+            break
         
-        # 取碰撞航段中点
         seg_s = path[collide_idx]
         seg_e = path[collide_idx + 1]
         mid = [
@@ -415,7 +410,6 @@ def generate_bypass_path(start, end, obs_list, side, safe_r, bypass_d):
             (seg_s[1] + seg_e[1]) / 2.0
         ]
 
-        # 计算航段方向向量
         dx = seg_e[1] - seg_s[1]
         dy = seg_e[0] - seg_s[0]
         line_len = math.hypot(dx, dy)
@@ -424,31 +418,25 @@ def generate_bypass_path(start, end, obs_list, side, safe_r, bypass_d):
         dx /= line_len
         dy /= line_len
 
-        # 计算垂直偏移方向（左=逆时针90°，右=顺时针90°）
         if side == "left":
-            perp_x = -dy  # 经度方向
-            perp_y = dx   # 纬度方向
+            perp_x = -dy
+            perp_y = dx
         else:
             perp_x = dy
             perp_y = -dx
         
-        # 中点向外侧偏移一个步长
         mid[0] += perp_y * step_lat
         mid[1] += perp_x * step_lon
 
-        # 插入中点，拆分航段
         path.insert(collide_idx + 1, mid)
 
-    # 最终强制校验：如果还碰撞，整体向绕行方向外扩总安全距离
+    # 最终兜底：如果还碰撞，用全局方向整体外扩
     if check_path_collide_buildings(path, obs_list):
-        perp_x_total = -dy if side == "left" else dy
-        perp_y_total = dx if side == "left" else -dx
-        off_lat, off_lon = meter_to_degree(total_safe_dist * 1.5, CAMPUS[0])
+        off_lat, off_lon = meter_to_degree(total_safe_dist * 2.0, CAMPUS[0])
         for i in range(1, len(path)-1):
-            path[i][0] += perp_y_total * off_lat
-            path[i][1] += perp_x_total * off_lon
+            path[i][0] += global_perp_y * off_lat
+            path[i][1] += global_perp_x * off_lon
 
-    # 强制对齐起点终点
     path[0] = start.copy()
     path[-1] = end.copy()
 
@@ -499,7 +487,6 @@ with tab1:
     with col_map:
         st.subheader("🗺️ 高德卫星底图（障碍圈选）")
         m = folium.Map(location=CAMPUS, zoom_start=17, control_scale=True)
-        # 高德卫星图层
         folium.TileLayer(
             "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
             attr="高德卫星图源", subdomains=["1","2","3","4"], name="卫星地图"
@@ -511,7 +498,6 @@ with tab1:
 
         alt = st.session_state.flight_alt
         total_buf_w = st.session_state.safe_radius + st.session_state.bypass_distance
-        # 渲染障碍物和缓冲区
         for obs_data in st.session_state.obstacles:
             obs = Obstacle.from_dict(obs_data)
             line_color = st.session_state.obs_fill_color if alt < obs.height else "green"
@@ -520,7 +506,6 @@ with tab1:
                 fill_color=st.session_state.obs_fill_color, fill_opacity=0.5,
                 popup=f"{obs.name}\n建筑高度：{obs.height}m"
             ).add_to(m)
-            # 飞行高度低于建筑时显示安全缓冲区
             if alt < obs.height:
                 buf_coords = obs.get_safe_buffer(st.session_state.safe_radius, st.session_state.bypass_distance)
                 folium.Polygon(
@@ -528,44 +513,38 @@ with tab1:
                     popup=f"安全绕行缓冲区 {total_buf_w}m"
                 ).add_to(m)
 
-        # 起终点标记
         folium.Marker(st.session_state.point_a, popup="🚁 起点A", icon=folium.Icon(color="green", icon="play")).add_to(m)
         folium.Marker(st.session_state.point_b, popup="🎯 终点B", icon=folium.Icon(color="red", icon="flag")).add_to(m)
 
-        # 渲染选中的规划航线
         if st.session_state.selected_plan:
             plan = st.session_state.selected_plan
             folium.PolyLine(
-                plan["points"], color=plan["color"], weight=3, 
-                opacity=0.9, dash_array='8, 4'
+                plan["points"], color=plan["color"], weight=4, 
+                opacity=1.0, dash_array='10, 5'
             ).add_to(m)
             for idx, wp in enumerate(plan["points"][1:-1], 1):
                 folium.CircleMarker(
-                    wp, radius=4, color="white", fill=True, 
+                    wp, radius=5, color="white", fill=True, 
                     fill_color=plan["color"], popup=f"航点{idx}"
                 ).add_to(m)
 
-        # 工具控件
         plugins.Draw(draw_options={"polygon": {"allowIntersection": False}}).add_to(m)
         plugins.MeasureControl(primary_length_unit='meters').add_to(m)
         folium.LayerControl().add_to(m)
         map_out = st_folium(m, width="100%", height=550, key="main_map")
 
-        # 捕获绘制的多边形障碍物
         if map_out and map_out.get("last_active_drawing"):
             draw_data = map_out["last_active_drawing"]
             if draw_data["geometry"]["type"] == "Polygon":
                 pts = [[coord[1], coord[0]] for coord in draw_data["geometry"]["coordinates"][0]]
-                # 移除首尾重复点
-                if len(pts) > 1 and pts[0][0] == pts[-1][0] and pts[0][1] == pts[-1][1]:
+                if len(pts) > 1 and abs(pts[0][0] - pts[-1][0]) < 1e-10 and abs(pts[0][1] - pts[-1][1]) < 1e-10:
                     pts.pop()
                 if len(pts) >= 3:
                     st.session_state.temp_obs = pts
                     st.session_state.show_height_panel = True
-                    st.success(f"✅ 绘制完成，障碍物顶点数：{len(pts)}")
+                    st.success(f"✅ 绘制完成，障碍物顶点数：{len(pts)}，请在右侧保存")
 
     with col_ctrl:
-        # 新建障碍物面板
         if st.session_state.show_height_panel and st.session_state.temp_obs:
             st.markdown("### 🆕 新建3D建筑障碍物")
             obs_name = st.text_input("障碍物名称", value=st.session_state.temp_name)
@@ -593,7 +572,6 @@ with tab1:
                     st.rerun()
             st.markdown("---")
 
-        # 起终点坐标
         st.markdown("### 🚁 起点A坐标")
         c_a1, c_a2 = st.columns(2)
         lat_a = c_a1.number_input("纬度", value=st.session_state.point_a[0], format="%.6f")
@@ -622,7 +600,6 @@ with tab1:
         st.session_state.bypass_distance = bypass_slider
         st.info(f"🛡️ 总安全缓冲区宽度：{safe_slider + bypass_slider} m")
 
-        # 高度校验
         if st.session_state.obstacles:
             st.markdown("**📊 建筑高度检测**")
             block_count = 0
@@ -669,7 +646,6 @@ with tab1:
             end_pt = st.session_state.point_b
             straight_dist = calc_distance(start_pt, end_pt)
             
-            # 筛选需要绕行的障碍物（飞行高度 < 建筑高度）
             block_obs = []
             for obs_data in st.session_state.obstacles:
                 obs = Obstacle.from_dict(obs_data)
@@ -685,8 +661,8 @@ with tab1:
                     "color": st.session_state.best_route_color,
                     "desc": "无遮挡建筑，直线直达"
                 })
+                st.success("✅ 无需要绕行的建筑，生成直线飞越航线")
             else:
-                # 左右两套绕行方案
                 dir_config = [
                     ("left", "⬅️ 左侧绕行", st.session_state.left_route_color),
                     ("right", "➡️ 右侧绕行", st.session_state.right_route_color)
@@ -701,18 +677,17 @@ with tab1:
                         "color": color,
                         "desc": f"逐栋绕开全部建筑，共{len(path)-2}个拐点"
                     })
-                # 自动选出最短最优航线
                 best_plan = min(plan_list, key=lambda x: x["dist"]).copy()
                 best_plan["name"] = "⭐ 最优最短航线"
                 best_plan["color"] = st.session_state.best_route_color
                 best_plan["desc"] = f"左右对比自动择优，总长{best_plan['dist']:.1f}m"
                 plan_list.append(best_plan)
+                st.success(f"✅ 成功生成3套航线方案，共{len(block_obs)}栋建筑绕行")
             
             st.session_state.route_plans = plan_list
             st.session_state.selected_plan = plan_list[-1]
             st.rerun()
 
-        # 方案列表
         if st.session_state.route_plans:
             st.markdown("---")
             st.markdown("### 📋 可选方案")
@@ -726,7 +701,7 @@ with tab1:
                 with col_t:
                     st.metric("时长", f"{p_item['dist']/15:.0f}s")
                 if st.session_state.selected_plan and st.session_state.selected_plan["name"] == p_item["name"]:
-                    st.success("✅ 当前选中")
+                    st.success("✅ 当前选中，地图上已显示航线")
                 else:
                     if st.button(f"选用此航线", key=f"sel_plan_{idx}", use_container_width=True):
                         st.session_state.selected_plan = p_item
@@ -880,7 +855,6 @@ with tab2:
                     if curr_wp_idx >= len(wp_list)-1:
                         add_business_log("全部航点飞行完成", color="green")
 
-            # 数据面板
             d1, d2, d3, d4, d5, d6 = st.columns(6)
             d1.metric("当前航点", f"{min(curr_wp_idx+1, len(wp_list))}/{len(wp_list)}")
             d2.metric("飞行速度", f"{sim_speed:.1f} m/s")
@@ -891,7 +865,6 @@ with tab2:
             st.progress(progress)
 
             st.markdown("---")
-            # 实时地图 + 通信日志
             map_col, log_col = st.columns([1.5, 1])
             with map_col:
                 st.markdown("**🗺️ 实时飞行地图**")
@@ -903,7 +876,7 @@ with tab2:
                 for obs_data in st.session_state.obstacles:
                     obs = Obstacle.from_dict(obs_data)
                     folium.Polygon(obs.points, color=st.session_state.obs_fill_color, fill=True, fill_opacity=0.5).add_to(m2)
-                folium.PolyLine(wp_list, color="green", weight=3, dash_array='8,4').add_to(m2)
+                folium.PolyLine(wp_list, color="lime", weight=3, dash_array='8,4').add_to(m2)
                 folium.Marker([curr_lat, curr_lon], popup="实时位置", icon=folium.Icon(color="green", icon="plane")).add_to(m2)
                 st_folium(m2, width="100%", height=300, key="flight_map")
 
@@ -929,4 +902,4 @@ with tab2:
             st.info("📭 请先导入已确认的航线")
 
 st.markdown("---")
-st.caption("无人机智能化应用2451 | 分组作业6-项目Demo | 最终修复版，建筑零穿墙")
+st.caption("无人机智能化应用2451 | 分组作业6-项目Demo | 稳定生成版")

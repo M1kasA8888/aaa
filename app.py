@@ -18,7 +18,8 @@ if 'obstacles' not in st.session_state:
         try:
             with open(OBSTACLE_FILE, 'r', encoding='utf-8') as f:
                 st.session_state.obstacles = json.load(f).get('obstacles', [])
-        except: pass
+        except Exception:
+            pass
 
 if 'point_a' not in st.session_state:
     st.session_state.point_a = [32.2347, 118.7490]
@@ -58,13 +59,13 @@ def point_in_polygon(pt, poly):
             inside = not inside
     return inside
 
-def _ccw(A,B,C):
+def _ccw(A, B, C):
     return (C[0]-A[0])*(B[1]-A[1]) - (B[0]-A[0])*(C[1]-A[1]) > 1e-8
 
-def seg_intersect_seg(a1,a2,b1,b2):
-    return _ccw(a1,b1,b2) != _ccw(a2,b1,b2) and _ccw(a1,a2,b1) != _ccw(a1,a2,b2)
+def seg_intersect_seg(a1, a2, b1, b2):
+    return _ccw(a1, b1, b2) != _ccw(a2, b1, b2) and _ccw(a1, a2, b1) != _ccw(a1, a2, b2)
 
-def seg_intersect_polygon(p0,p1,poly):
+def seg_intersect_polygon(p0, p1, poly):
     if point_in_polygon(p0, poly) or point_in_polygon(p1, poly):
         return True
     n = len(poly)
@@ -80,7 +81,7 @@ def generate_route(start, end, obstacles, side, safe_m):
     max_iter = 600
 
     for _ in range(max_iter):
-        # 找第一个碰撞的航段
+        # 查找第一个碰撞航段
         collide_idx = -1
         for i in range(len(path)-1):
             for obs in obstacles:
@@ -100,11 +101,12 @@ def generate_route(start, end, obstacles, side, safe_m):
         dx = e[1] - s[1]
         dy = e[0] - s[0]
         line_len = math.hypot(dx, dy)
-        if line_len < 1e-9: break
+        if line_len < 1e-9:
+            break
         dx /= line_len
         dy /= line_len
 
-        # 左右方向
+        # 计算左右垂直方向
         if side == "left":
             px, py = -dy, dx
         else:
@@ -142,11 +144,11 @@ with col_map:
             popup=f"{obs['name']} | {obs['height']}m"
         ).add_to(m)
 
-    # 起终点
+    # 起终点标记
     folium.Marker(st.session_state.point_a, icon=folium.Icon(color="green", icon="play"), popup="起点").add_to(m)
     folium.Marker(st.session_state.point_b, icon=folium.Icon(color="red", icon="flag"), popup="终点").add_to(m)
 
-    # 渲染生成的航线（亮黄色粗虚线，非常醒目）
+    # 渲染生成的航线（亮黄色粗线，醒目可见）
     if st.session_state.route_result:
         folium.PolyLine(
             st.session_state.route_result,
@@ -164,8 +166,11 @@ with col_map:
     if map_out and map_out.get("last_active_drawing"):
         draw = map_out["last_active_drawing"]
         if draw["geometry"]["type"] == "Polygon":
-            pts = [[c[1], c[0]] for c in draw["geometry"]["coordinates"][0]]
-            if len(pts) > 1 and pts[0] == pts[-1]: pts.pop()
+            coords = draw["geometry"]["coordinates"][0]
+            pts = [[c[1], c[0]] for c in coords]
+            # 移除首尾重复点
+            if len(pts) > 1 and abs(pts[0][0]-pts[-1][0])<1e-10 and abs(pts[0][1]-pts[-1][1])<1e-10:
+                pts.pop()
             if len(pts) >= 3:
                 st.session_state.temp_obs = pts
                 st.success("✅ 已绘制建筑轮廓，请在右侧填写信息并保存")
@@ -173,7 +178,7 @@ with col_map:
 with col_ctrl:
     st.subheader("⚙️ 控制面板")
 
-    # 新建障碍物
+    # 新建障碍物面板
     if st.session_state.temp_obs:
         st.markdown("### 🆕 新建建筑")
         obs_name = st.text_input("建筑名称", value="教学楼")
@@ -216,13 +221,14 @@ with col_ctrl:
     st.session_state.flight_alt = st.slider("飞行高度(m)", 10, 100, 20)
     st.session_state.safe_dist = st.slider("安全距离(m)", 2, 30, 5)
 
-    # 建筑状态
+    # 建筑列表
     st.markdown("---")
     st.markdown("### 🏢 已保存建筑")
     block_count = 0
     for idx, obs in enumerate(st.session_state.obstacles):
         need_bypass = st.session_state.flight_alt < obs["height"]
-        if need_bypass: block_count += 1
+        if need_bypass:
+            block_count += 1
         tag = "🔄 需绕行" if need_bypass else "✅ 可飞越"
         with st.expander(f"{tag} {obs['name']} {obs['height']}m"):
             if st.button("删除", key=f"del_{idx}", use_container_width=True):
@@ -234,15 +240,15 @@ with col_ctrl:
 
     st.markdown("---")
     st.markdown("### 🎯 生成航线")
-    if st.button("一键生成最优航线", use_container_width=True, type="primary", height=50):
-        # 筛选需绕行的建筑
+    if st.button("一键生成最优航线", use_container_width=True, type="primary"):
+        # 筛选需要绕行的建筑
         block_obs = [o for o in st.session_state.obstacles if st.session_state.flight_alt < o["height"]]
         
         if len(block_obs) == 0:
             st.session_state.route_result = [st.session_state.point_a, st.session_state.point_b]
-            st.success("无遮挡建筑，生成直线航线")
+            st.success("无遮挡建筑，生成直线飞越航线")
         else:
-            # 生成左右两条选最短
+            # 生成左右两条航线，选最短的
             left_path = generate_route(st.session_state.point_a, st.session_state.point_b, block_obs, "left", st.session_state.safe_dist)
             right_path = generate_route(st.session_state.point_a, st.session_state.point_b, block_obs, "right", st.session_state.safe_dist)
             
@@ -258,4 +264,4 @@ with col_ctrl:
         st.info(f"航线总长度：{total_len:.1f} 米 | 航点数量：{len(st.session_state.route_result)} 个")
 
 st.markdown("---")
-st.caption("无人机航线规划系统 | 稳定运行版")
+st.caption("无人机航线规划系统 | 修复报错稳定版")

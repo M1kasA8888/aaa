@@ -8,8 +8,6 @@ import os
 import random
 import time
 from datetime import datetime, timedelta
-import pandas as pd
-import plotly.graph_objects as go
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机智能监控系统", page_icon="🛰️", layout="wide")
@@ -83,6 +81,8 @@ if "flight_sim_segment_distances" not in st.session_state:
     st.session_state.flight_sim_segment_distances = []
 if "flight_sim_last_wp_index" not in st.session_state:
     st.session_state.flight_sim_last_wp_index = -1
+if "drone_current_pos" not in st.session_state:
+    st.session_state.drone_current_pos = st.session_state.point_a.copy()
 
 # 通信日志
 if "comm_logs_business" not in st.session_state:
@@ -378,68 +378,108 @@ def calc_path_total_dist(waypoints):
         total += d
     return total, seg_dist
 
+# ==================== 地图生成通用函数（统一渲染样式，匹配截图） ====================
+def create_base_map(center, zoom=17):
+    m = folium.Map(location=center, zoom_start=zoom, control_scale=True)
+    # 默认高德卫星底图（截图样式）
+    folium.TileLayer(
+        "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
+        attr="高德卫星影像", subdomains=["1","2","3","4"], show=True
+    ).add_to(m)
+    folium.TileLayer(
+        "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="OpenStreetMap街道图", name="街道底图", show=False
+    ).add_to(m)
+    # 绘制工具栏
+    draw_control = plugins.Draw(
+        draw_options={"polygon": {"allowIntersection": False, "shapeOptions":{"color":"red","fillColor":"red","fillOpacity":0.3}}},
+        edit_options={"poly": {"allowIntersection": False}}
+    )
+    draw_control.add_to(m)
+    # 测距工具
+    plugins.MeasureControl(position="topleft", primary_length_unit="meters").add_to(m)
+    # 图层切换
+    folium.LayerControl(collapsed=False).add_to(m)
+    # 十字坐标辅助线
+    plugins.MousePosition().add_to(m)
+    return m
+
+def render_map_content(m, drone_pos=None):
+    alt = st.session_state.flight_alt
+    total_buf_w = st.session_state.safe_radius + st.session_state.bypass_distance
+    # 绘制障碍物 红色填充多边形
+    for obs_data in st.session_state.obstacles:
+        obs = Obstacle.from_dict(obs_data)
+        line_color = "red" if alt < obs.height else "green"
+        folium.Polygon(
+            obs.points, color=line_color, weight=3, fill=True,
+            fill_color=line_color, fill_opacity=0.4,
+            popup=f"{obs.name}\n建筑高度：{obs.height}m\n飞行高度{alt}m"
+        ).add_to(m)
+        # 绘制安全缓冲区 蓝色虚线
+        if alt < obs.height:
+            buf_coords = obs.get_safe_buffer(st.session_state.safe_radius, st.session_state.bypass_distance)
+            folium.Polygon(
+                buf_coords, color="blue", weight=2, dash_array="5,5", fill=False,
+                popup=f"安全缓冲区域 宽度{total_buf_w}m"
+            ).add_to(m)
+    # 起点绿色标记、终点红色标记（和截图一致）
+    folium.Marker(
+        st.session_state.point_a, popup="🚁 起飞起点",
+        icon=folium.Icon(color="green", icon="play", prefix="fa")
+    ).add_to(m)
+    folium.Marker(
+        st.session_state.point_b, popup="🎯 目标终点",
+        icon=folium.Icon(color="red", icon="map-pin", prefix="fa")
+    ).add_to(m)
+    # 绘制选中航线：蓝色虚线（核心优化，匹配截图蓝白虚线）
+    if st.session_state.selected_plan:
+        plan = st.session_state.selected_plan
+        folium.PolyLine(
+            plan["points"], color="blue", weight=4, opacity=0.85,
+            dash_array="8,4",  # 虚线间隔 8像素实线 4像素空白，和示例图完全一致
+            popup=f"{plan['name']} 航线总长 {plan['dist']:.1f}m"
+        ).add_to(m)
+        # 绘制中间绕行拐点紫色标记
+        for idx, wp in enumerate(plan["points"][1:-1], 1):
+            folium.Marker(
+                wp, popup=f"绕行拐点{idx}",
+                icon=folium.Icon(color="purple", icon="refresh", prefix="fa")
+            ).add_to(m)
+    # 飞行监控页增加无人机实时位置
+    if drone_pos is not None:
+        folium.Marker(
+            drone_pos, popup="✈️ 当前无人机位置",
+            icon=folium.Icon(color="cyan", icon="plane", prefix="fa")
+        ).add_to(m)
+    return m
+
 # ==================== 页面主体渲染 ====================
 st.title("🛰️ 无人机智能监控系统")
-st.markdown("**南京科技职业学院** | 多建筑逐栋绕行 | 全程不穿墙 | 仅左/右/最优3套方案")
+st.markdown("**南京科技职业学院** | 建筑障碍物圈选记忆 | 安全缓冲绕行航线 | 实时飞行监控")
 st.markdown("---")
 
 # 侧边栏
 with st.sidebar:
-    st.subheader("🌐 坐标系")
-    st.selectbox("输入坐标系", ["WGS-84", "GCJ-02 (高德/百度)"])
+    st.subheader("🌐 坐标系统")
+    st.selectbox("地图坐标系", ["WGS-84", "GCJ-02 (高德/百度)"])
     st.markdown("---")
-    st.subheader("📊 系统状态")
-    st.success("✅ 系统正常")
+    st.subheader("📊 系统运行状态")
+    st.success("✅ 机载通信链路正常")
+    st.info(f"🛡️ 全局安全半径：{st.session_state.safe_radius} m")
 
-tab1, tab2 = st.tabs(["🗺️ 航线规划", "📡 飞行监控"])
+tab1, tab2 = st.tabs(["🗺️ 航线规划（障碍物圈选）", "📡 飞行实时监控"])
 
 # ========== 航线规划Tab ==========
 with tab1:
     col_map, col_ctrl = st.columns([1.5, 1])
     with col_map:
-        st.subheader("🗺️ 卫星地图")
-        m = folium.Map(location=CAMPUS, zoom_start=17, control_scale=True)
-        folium.TileLayer(
-            "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
-            attr="高德卫星", subdomains=["1","2","3","4"]
-        ).add_to(m)
-        folium.TileLayer(
-            "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-            attr="OpenStreetMap", name="街道地图"
-        ).add_to(m)
-        folium.Marker(CAMPUS, popup="🏫 南京科技职业学院", icon=folium.Icon(color="red")).add_to(m)
+        st.subheader("卫星航拍地图（可圈选障碍物）")
+        m = create_base_map(CAMPUS, zoom=17)
+        m = render_map_content(m)
+        map_out = st_folium(m, width="100%", height=480, key="plan_map")
 
-        alt = st.session_state.flight_alt
-        total_buf_w = st.session_state.safe_radius + st.session_state.bypass_distance
-        for obs_data in st.session_state.obstacles:
-            obs = Obstacle.from_dict(obs_data)
-            line_color = "red" if alt < obs.height else "green"
-            folium.Polygon(
-                obs.points, color=line_color, weight=2, fill=True,
-                fill_color=line_color, fill_opacity=0.3,
-                popup=f"{obs.name}\n高度：{obs.height}m"
-            ).add_to(m)
-            if alt < obs.height:
-                buf_coords = obs.get_safe_buffer(st.session_state.safe_radius, st.session_state.bypass_distance)
-                folium.Polygon(
-                    buf_coords, color="blue", weight=1.5, dash_array="5,5", fill=False,
-                    popup=f"安全缓冲区 {total_buf_w}m"
-                ).add_to(m)
-
-        folium.Marker(st.session_state.point_a, popup="🚁 起点A", icon=folium.Icon(color="green")).add_to(m)
-        folium.Marker(st.session_state.point_b, popup="🎯 终点B", icon=folium.Icon(color="red")).add_to(m)
-
-        if st.session_state.selected_plan:
-            plan = st.session_state.selected_plan
-            folium.PolyLine(plan["points"], color=plan["color"], weight=4, opacity=0.9).add_to(m)
-            for idx, wp in enumerate(plan["points"][1:-1], 1):
-                folium.Marker(wp, popup=f"绕行点{idx}", icon=folium.Icon(color="purple", icon="refresh")).add_to(m)
-
-        plugins.Draw(draw_options={"polygon": {"allowIntersection": False}}).add_to(m)
-        plugins.MeasureControl().add_to(m)
-        folium.LayerControl().add_to(m)
-        map_out = st_folium(m, width=650, height=450, key="main_map")
-
+        # 捕获绘制的障碍物多边形
         if map_out and map_out.get("last_active_drawing"):
             draw_data = map_out["last_active_drawing"]
             if draw_data["geometry"]["type"] == "Polygon":
@@ -447,24 +487,24 @@ with tab1:
                 if len(pts) >= 3:
                     st.session_state.temp_obs = pts
                     st.session_state.show_height_panel = True
-                    st.success(f"✅ 已绘制{len(pts)}个顶点障碍物")
+                    st.success(f"✅ 成功圈选障碍物，顶点数量：{len(pts)}，请填写建筑高度保存")
 
     with col_ctrl:
         # 新建障碍物弹窗
         if st.session_state.show_height_panel and st.session_state.temp_obs:
-            st.markdown("### 🆕 新建3D障碍物")
+            st.markdown("### 🆕 保存障碍物建筑")
             obs_name = st.text_input("障碍物名称", value=st.session_state.temp_name)
             st.session_state.temp_name = obs_name if obs_name else "建筑物"
-            obs_h = st.number_input("障碍物高度(m)", min_value=1, max_value=200, step=5, value=st.session_state.temp_height)
+            obs_h = st.number_input("建筑高度(m)", min_value=1, max_value=200, step=5, value=st.session_state.temp_height)
             st.session_state.temp_height = obs_h
             fly_h = st.session_state.flight_alt
             if fly_h < obs_h:
-                st.warning(f"⚠️ 飞行高度{fly_h}m < 建筑高度{obs_h}m，自动触发绕行")
+                st.warning(f"⚠️ 飞行高度{fly_h}m 低于建筑{obs_h}m，航线自动绕行安全缓冲区")
             else:
-                st.success(f"✅ 可直接飞越")
+                st.success(f"✅ 飞行高度充足，可直接飞越该建筑")
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("✅ 保存障碍物", type="primary", use_container_width=True):
+                if st.button("✅ 存入障碍物库", type="primary", use_container_width=True):
                     new_obs = {"points": st.session_state.temp_obs, "height": obs_h, "name": obs_name}
                     st.session_state.obstacles.append(new_obs)
                     save_obstacles_to_file()
@@ -472,69 +512,69 @@ with tab1:
                     st.session_state.show_height_panel = False
                     st.rerun()
             with c2:
-                if st.button("🗑️ 取消", use_container_width=True):
+                if st.button("🗑️ 取消本次绘制", use_container_width=True):
                     st.session_state.temp_obs = None
                     st.session_state.show_height_panel = False
                     st.rerun()
             st.markdown("---")
 
-        # 起点终点设置
-        st.markdown("### 🚁 起点A坐标")
+        # 起点终点坐标配置
+        st.markdown("### 🚁 起飞起点 A")
         c_a1, c_a2 = st.columns(2)
         lat_a = c_a1.number_input("纬度", value=st.session_state.point_a[0], format="%.6f")
         lon_a = c_a2.number_input("经度", value=st.session_state.point_a[1], format="%.6f")
-        if st.button("📍 设置A点", use_container_width=True):
+        if st.button("📍 更新起点坐标", use_container_width=True):
             st.session_state.point_a = [lat_a, lon_a]
             save_waypoints()
             st.rerun()
 
-        st.markdown("### 🎯 终点B坐标")
+        st.markdown("### 🎯 目标终点 B")
         c_b1, c_b2 = st.columns(2)
         lat_b = c_b1.number_input("纬度", value=st.session_state.point_b[0], format="%.6f", key="latb")
         lon_b = c_b2.number_input("经度", value=st.session_state.point_b[1], format="%.6f", key="lonb")
-        if st.button("🏁 设置B点", use_container_width=True):
+        if st.button("🏁 更新终点坐标", use_container_width=True):
             st.session_state.point_b = [lat_b, lon_b]
             save_waypoints()
             st.rerun()
 
         st.markdown("---")
-        st.markdown("### ⚙️ 飞行参数")
+        st.markdown("### ⚙️ 飞行安全参数（需求安全半径配置）")
         alt_slider = st.slider("飞行高度(m)", min_value=10, max_value=100, value=st.session_state.flight_alt)
         st.session_state.flight_alt = alt_slider
-        safe_slider = st.slider("安全半径(m)", min_value=5, max_value=30, value=st.session_state.safe_radius)
+        safe_slider = st.slider("无人机安全半径(m)", min_value=5, max_value=30, value=st.session_state.safe_radius)
         st.session_state.safe_radius = safe_slider
-        bypass_slider = st.slider("绕行距离(m)", min_value=5, max_value=50, value=st.session_state.bypass_distance)
+        bypass_slider = st.slider("额外绕行预留距离(m)", min_value=5, max_value=50, value=st.session_state.bypass_distance)
         st.session_state.bypass_distance = bypass_slider
-        st.info(f"🛡️ 总安全缓冲区宽度：{safe_slider + bypass_slider} m")
+        st.info(f"🛡️ 障碍物总安全缓冲区宽度：{safe_slider + bypass_slider} m，航线全程不会进入该区域")
 
-        # 高度检测列表
+        # 障碍物高度校验列表
         if st.session_state.obstacles:
-            st.markdown("**📊 障碍物高度校验**")
+            st.markdown("**📊 建筑高度校验清单**")
             for obs_data in st.session_state.obstacles:
                 obs = Obstacle.from_dict(obs_data)
                 if alt_slider < obs.height:
-                    st.warning(f"🔄 {obs.name}({obs.height}m)，必须绕行")
+                    st.warning(f"🔄 {obs.name}（高{obs.height}m）：必须绕行")
                 else:
-                    st.success(f"✅ {obs.name}，可飞越")
+                    st.success(f"⬆️ {obs.name}：可直接飞越")
 
         st.markdown("---")
-        st.markdown("### 🚧 已保存障碍物列表")
+        st.markdown("### 🧱 已保存障碍物列表（持久记忆）")
         for idx, obs_data in enumerate(st.session_state.obstacles):
             obs = Obstacle.from_dict(obs_data)
             icon_tag = "🔄" if alt_slider < obs.height else "⬆️"
-            with st.expander(f"{icon_tag} {obs.name} 高度{obs.height}m"):
-                if st.button("删除", key=f"del_obs_{idx}", use_container_width=True):
+            with st.expander(f"{icon_tag} {obs.name} | 高度 {obs.height}m"):
+                if st.button("删除该建筑", key=f"del_obs_{idx}", use_container_width=True):
                     st.session_state.obstacles.pop(idx)
                     save_obstacles_to_file()
                     st.rerun()
 
         c_save, c_load, c_clear = st.columns(3)
         with c_save:
-            if st.button("💾 保存全部配置", use_container_width=True):
+            if st.button("💾 保存全部障碍物配置", use_container_width=True):
                 save_obstacles_to_file()
-                st.success("已保存")
+                st.success("障碍物数据已本地持久化")
         with c_load:
-            if st.button("📂 加载配置", use_container_width=True):
+            if st.button("📂 读取本地障碍物", use_container_width=True):
                 load_obstacles_from_file()
                 st.rerun()
         with c_clear:
@@ -544,8 +584,8 @@ with tab1:
                 st.rerun()
 
         st.markdown("---")
-        st.markdown("## 🗺️ 生成航线（仅左/右/最优3套）")
-        if st.button("🎯 一键生成航线方案", use_container_width=True, type="primary"):
+        st.markdown("## 🚀 一键生成安全绕行航线（左/右/最优3套方案）")
+        if st.button("🎯 生成全部航线方案", use_container_width=True, type="primary"):
             start_pt = st.session_state.point_a
             end_pt = st.session_state.point_b
             straight_dist = calc_distance(start_pt, end_pt)
@@ -553,14 +593,14 @@ with tab1:
             plan_list = []
             if len(block_obs) == 0:
                 plan_list.append({
-                    "name": "📏 直线飞越",
+                    "name": "📏 直线飞越航线",
                     "points": [start_pt, end_pt],
                     "dist": straight_dist,
                     "color": "blue",
-                    "desc": "无遮挡，直线飞行"
+                    "desc": "无遮挡障碍物，直线直达"
                 })
             else:
-                dir_config = [("left", "⬅️ 左侧绕行", "orange"), ("right", "➡️ 右侧绕行", "purple")]
+                dir_config = [("left", "⬅️ 左侧绕行方案", "orange"), ("right", "➡️ 右侧绕行方案", "purple")]
                 for side, name, color in dir_config:
                     path = generate_bypass_path(start_pt, end_pt, block_obs, block_bufs, side, safe_slider, bypass_slider)
                     dist_total, _ = calc_path_total_dist(path)
@@ -569,22 +609,22 @@ with tab1:
                         "points": path,
                         "dist": dist_total,
                         "color": color,
-                        "desc": "逐栋绕开全部缓冲区，无穿墙"
+                        "desc": "自动绕开全部建筑安全缓冲区，无穿墙风险"
                     })
-                # 自动最优最短航线
+                # 最优最短航线
                 best_plan = min(plan_list, key=lambda x: x["dist"]).copy()
                 best_plan["name"] = "⭐ 最优最短航线"
                 best_plan["color"] = "gold"
-                best_plan["desc"] = f"左右绕行最短路径，总长{best_plan['dist']:.1f}m"
+                best_plan["desc"] = f"左右绕行对比最短路径，总长{best_plan['dist']:.1f}m"
                 plan_list.append(best_plan)
             st.session_state.route_plans = plan_list
             st.session_state.selected_plan = plan_list[-1]
             st.rerun()
 
-        # 方案选择展示
+        # 航线方案选择面板
         if st.session_state.route_plans:
             st.markdown("---")
-            st.markdown("### 📋 可选航线方案")
+            st.markdown("### 📋 可选航线方案预览")
             for idx, p_item in enumerate(st.session_state.route_plans):
                 col_n, col_d, col_t = st.columns([2,1,1])
                 with col_n:
@@ -593,11 +633,11 @@ with tab1:
                 with col_d:
                     st.metric("航线总长", f"{p_item['dist']:.0f}m")
                 with col_t:
-                    st.metric("预估时长", f"{p_item['dist']/15:.0f}s")
+                    st.metric("预估飞行时长", f"{p_item['dist']/15:.0f}s")
                 if st.session_state.selected_plan and st.session_state.selected_plan["name"] == p_item["name"]:
-                    st.success("✅ 已选中")
+                    st.success("✅ 当前地图预览此航线（蓝色虚线）")
                 else:
-                    if st.button(f"选用此方案", key=f"sel_plan_{idx}", use_container_width=True):
+                    if st.button(f"预览此方案", key=f"sel_plan_{idx}", use_container_width=True):
                         st.session_state.selected_plan = p_item
                         st.rerun()
                 st.markdown("---")
@@ -605,28 +645,28 @@ with tab1:
             if st.session_state.selected_plan:
                 sel_plan = st.session_state.selected_plan
                 diff_len = sel_plan["dist"] - calc_distance(st.session_state.point_a, st.session_state.point_b)
-                st.info(f"当前选中：{sel_plan['name']}，多出绕行距离 {diff_len:.0f} m")
-                if st.button("✈️ 确认锁定该航线", use_container_width=True, type="primary"):
+                st.info(f"当前预览航线：{sel_plan['name']}，相比直线多出绕行距离 {diff_len:.0f} m")
+                if st.button("✈️ 锁定确认该航线（进入飞行监控）", use_container_width=True, type="primary"):
                     st.session_state.confirmed_plan = sel_plan
-                    st.success("✅ 航线确认完毕，可切换至飞行监控")
+                    st.success("✅ 航线锁定完成，切换至「飞行实时监控」标签页执行仿真")
                     st.balloons()
 
         if st.session_state.confirmed_plan:
             st.markdown("---")
-            st.markdown("### ✅ 已锁定执行航线")
+            st.markdown("### ✅ 已锁定待执行航线")
             fix_plan = st.session_state.confirmed_plan
             st.success(f"**{fix_plan['name']}**")
-            st.caption(f"航线总长：{fix_plan['dist']:.0f} m，预估飞行 {fix_plan['dist']/15:.0f} s")
+            st.caption(f"航线总长度：{fix_plan['dist']:.0f} m，预估飞行 {fix_plan['dist']/15:.0f} 秒")
 
 # ========== 飞行监控Tab ==========
 with tab2:
-    st.subheader("📡 实时飞行任务监控")
+    st.subheader("📡 无人机实时飞行任务监控面板")
     col_sim_ctrl, col_sim_view = st.columns([1, 2])
     with col_sim_ctrl:
-        st.markdown("### 🎮 仿真控制")
-        if st.button("📐 导入已确认航线", use_container_width=True):
+        st.markdown("### 🎮 仿真任务控制")
+        if st.button("📐 导入已锁定航线", use_container_width=True):
             if st.session_state.confirmed_plan is None:
-                st.warning("请先在航线规划页确认航线！")
+                st.warning("请先在航线规划页面完成航线确认锁定！")
             else:
                 wp_list = st.session_state.confirmed_plan["points"]
                 total_d, seg_d = calc_path_total_dist(wp_list)
@@ -637,10 +677,11 @@ with tab2:
                 st.session_state.flight_sim_running = False
                 st.session_state.flight_sim_start_time = None
                 st.session_state.flight_sim_last_wp_index = -1
+                st.session_state.drone_current_pos = wp_list[0].copy()
                 clear_all_logs()
-                add_business_log(f"航线导入成功，航点数量{len(wp_list)}，总长{total_d:.1f}m")
-                add_gcs_to_fcu_log("GCS→OBC: MISSION_UPLOAD")
-                add_fcu_to_gcs_log("FCU→OBC: MISSION_ACK")
+                add_business_log(f"航线导入成功，航点总数{len(wp_list)}，航线总长{total_d:.1f}m")
+                add_gcs_to_fcu_log("地面站→机载：MISSION_UPLOAD 任务下发")
+                add_fcu_to_gcs_log("飞控→地面站：MISSION_ACK 任务接收确认")
                 st.success(f"✅ 航线载入完成，共{len(wp_list)}个航点")
                 st.rerun()
 
@@ -654,39 +695,40 @@ with tab2:
         st.markdown("---")
         c_start, c_stop, c_reset = st.columns(3)
         with c_start:
-            btn_start = st.button("▶️ 启动任务", use_container_width=True, disabled=(len(wp_list)==0))
+            btn_start = st.button("▶️ 启动自动飞行任务", use_container_width=True, disabled=(len(wp_list)==0))
             if btn_start:
                 st.session_state.flight_sim_running = True
                 if st.session_state.flight_sim_start_time is None:
                     st.session_state.flight_sim_start_time = time.time()
-                add_fcu_to_gcs_log("FCU→OBC→GCS: ACK | AUTO模式开启")
+                add_fcu_to_gcs_log("飞控→地面站：AUTO模式开启，开始自主巡航")
                 st.rerun()
         with c_stop:
-            if st.button("⏹️ 中止飞行", use_container_width=True):
+            if st.button("⏹️ 紧急中止飞行", use_container_width=True):
                 st.session_state.flight_sim_running = False
+                add_business_log("用户手动中止飞行任务", color="red")
                 st.rerun()
         with c_reset:
-            if st.button("🔄 重置仿真", use_container_width=True):
+            if st.button("🔄 重置仿真至起点", use_container_width=True):
                 st.session_state.flight_sim_running = False
                 st.session_state.flight_sim_start_time = None
                 st.session_state.flight_sim_current_index = 0
                 st.session_state.flight_sim_last_wp_index = -1
+                st.session_state.drone_current_pos = wp_list[0].copy() if len(wp_list)>0 else st.session_state.point_a.copy()
                 clear_all_logs()
                 st.rerun()
 
         st.markdown("---")
-        st.markdown("### 📋 航线基础信息")
-        st.caption(f"起点A：{st.session_state.point_a[0]:.6f}, {st.session_state.point_a[1]:.6f}")
-        st.caption(f"终点B：{st.session_state.point_b[0]:.6f}, {st.session_state.point_b[1]:.6f}")
+        st.markdown("### 📋 当前航线基础参数")
+        st.caption(f"起飞起点：{st.session_state.point_a[0]:.6f}, {st.session_state.point_a[1]:.6f}")
+        st.caption(f"目标终点：{st.session_state.point_b[0]:.6f}, {st.session_state.point_b[1]:.6f}")
         st.caption(f"飞行高度：{st.session_state.flight_alt} m")
         st.caption(f"安全半径：{st.session_state.safe_radius} m")
-        st.caption(f"绕行距离：{st.session_state.bypass_distance} m")
-        st.caption(f"航点总数：{len(wp_list)}")
+        st.caption(f"航点总数量：{len(wp_list)}")
         if total_dist_sim > 0:
-            st.caption(f"航线总长度：{total_dist_sim:.1f} m")
+            st.caption(f"航线总里程：{total_dist_sim:.1f} m")
 
         st.markdown("---")
-        st.markdown("### 💓 链路心跳监控")
+        st.markdown("### 💓 机载链路心跳监控")
         if not st.session_state.heartbeat_running:
             if st.button("▶️ 启动心跳检测", use_container_width=True):
                 st.session_state.heartbeat_sim.start()
@@ -700,13 +742,13 @@ with tab2:
         hb_item = st.session_state.heartbeat_sim.update()
         if hb_item:
             if hb_item["status"] == "timeout":
-                st.error(f"⚠️ 链路超时，3s无心跳反馈")
+                st.error(f"⚠️ 链路心跳超时，3秒无飞控反馈")
             else:
-                st.success(f"💓 心跳正常 | ID:{hb_item['id']} 延迟:{hb_item['delay']}ms")
+                st.success(f"💓 心跳正常 | 序号:{hb_item['id']} 往返延迟:{hb_item['delay']}ms")
         hb_stats = st.session_state.heartbeat_sim.get_stats()
         ch1, ch2 = st.columns(2)
-        ch1.metric("总心跳包数", hb_stats["total"])
-        ch2.metric("心跳成功率", f"{hb_stats['rate']}%")
+        ch1.metric("累计心跳包", hb_stats["total"])
+        ch2.metric("通信成功率", f"{hb_stats['rate']}%")
 
     with col_sim_view:
         if len(wp_list) > 0:
@@ -731,6 +773,7 @@ with tab2:
                         p1 = wp_list[min(seg_idx+1, len(wp_list)-1)]
                         curr_lat = p0[0] + (p1[0]-p0[0])*seg_progress
                         curr_lon = p0[1] + (p1[1]-p0[1])*seg_progress
+                        st.session_state.drone_current_pos = [curr_lat, curr_lon]
                         break
                     total_flown_seg += seg_d
                 else:
@@ -750,55 +793,59 @@ with tab2:
 
                 if curr_wp_idx > st.session_state.flight_sim_last_wp_index:
                     st.session_state.flight_sim_last_wp_index = curr_wp_idx
-                    add_fcu_to_gcs_log(f"FCU→GCS: 抵达航点#{curr_wp_idx}")
+                    add_fcu_to_gcs_log(f"飞控→地面站：抵达航点#{curr_wp_idx+1}")
                     if curr_wp_idx >= len(wp_list)-1:
-                        add_fcu_to_gcs_log("FCU→GCS: MISSION_COMPLETE 任务结束")
-                        add_business_log("完整航线执行完毕", color="green")
+                        add_fcu_to_gcs_log("飞控→地面站：MISSION_COMPLETE 全部航点执行完成")
+                        add_business_log("完整航线自动巡航任务结束", color="green")
 
-            st.markdown("### 📊 实时飞行数据")
+            # 实时飞行数据面板（需求全部指标）
+            st.markdown("### 📊 实时飞行监控数据")
             r1c1, r1c2, r1c3, r1c4 = st.columns(4)
             r1c1.metric("当前航点", f"{min(curr_wp_idx+1, len(wp_list))}/{len(wp_list)}")
-            r1c2.metric("飞行速度", f"{sim_speed:.1f} m/s")
+            r1c2.metric("实时飞行速度", f"{sim_speed:.1f} m/s")
             r1c3.metric("已飞行时长", time_elapse_str)
-            r1c4.metric("剩余距离", f"{remain_d:.0f} m")
+            r1c4.metric("剩余飞行距离", f"{remain_d:.0f} m")
 
             r2c1, r2c2, r2c3, _ = st.columns(4)
-            r2c1.metric("预计剩余时间", time_remain_str)
-            r2c2.metric("剩余电量", f"{batt:.0f}%")
-            r2c3.metric("完成进度", f"{progress_rate*100:.0f}%")
+            r2c1.metric("预计到达剩余时间", time_remain_str)
+            r2c2.metric("剩余模拟电量", f"{batt:.0f}%")
+            r2c3.metric("整体飞行进度", f"{progress_rate*100:.0f}%")
             st.progress(min(1.0, progress_rate))
 
             st.markdown("---")
-            st.markdown("### 📶 通信链路状态")
-            gcs_col, obc_col, fcu_col = st.columns(3)
-            with gcs_col: st.success("✅ GCS 地面站在线")
-            with obc_col: st.success("✅ OBC机载计算机在线")
-            with fcu_col: st.success("✅ FCU飞控在线")
-            st.markdown("---")
+            st.markdown("### 🗺️ 实时飞行地图（蓝色虚线航线）")
+            # 监控页地图同步渲染蓝色虚线航线+无人机实时点位
+            m_sim = create_base_map(CAMPUS, zoom=17)
+            m_sim = render_map_content(m_sim, drone_pos=st.session_state.drone_current_pos)
+            st_folium(m_sim, width="100%", height=320, key="sim_map")
 
-            if st.session_state.flight_sim_running:
-                st.info("✈️ 飞行任务执行中...")
-            elif curr_wp_idx >= len(wp_list)-1:
-                st.success("✅ 全部航点飞行完成！")
-            else:
-                st.info("⏸️ 仿真已暂停，等待启动")
+            st.markdown("---")
+            st.markdown("### 📶 机载通信链路状态")
+            gcs_col, obc_col, fcu_col = st.columns(3)
+            with gcs_col: st.success("✅ 地面站GCS在线")
+            with obc_col: st.success("✅ 机载计算机OBC在线")
+            with fcu_col: st.success("✅ 飞控FCU在线")
 
             st.markdown("---")
             st.markdown("### 📝 上下行通信日志")
-            log_box = st.container(height=200)
+            log_box = st.container(height=180)
             with log_box:
+                st.caption("【业务日志】")
                 for log_item in st.session_state.comm_logs_business[-10:]:
-                    st.caption(f"📋 [{log_item['timestamp']}] {log_item['message']}")
-                for log_item in st.session_state.comm_logs_fcu_to_gcs[-5:]:
-                    st.caption(f"⬆️ {log_item}")
-                for log_item in st.session_state.comm_logs_gcs_to_fcu[-5:]:
-                    st.caption(f"⬇️ {log_item}")
+                    st.caption(f"[{log_item['timestamp']}] {log_item['message']}")
+                st.caption("⬆️ 飞控→地面站 上行报文")
+                for log_item in st.session_state.comm_logs_fcu_to_gcs[-6:]:
+                    st.caption(log_item)
+                st.caption("⬇️ 地面站→飞控 下行指令")
+                for log_item in st.session_state.comm_logs_gcs_to_fcu[-6:]:
+                    st.caption(log_item)
 
+            # 飞行仿真自动刷新
             if st.session_state.flight_sim_running:
                 time.sleep(1.0)
                 st.rerun()
         else:
-            st.info("请先在航线规划页确认航线，再执行「导入已确认航线」")
+            st.info("操作步骤：1.航线规划页锁定航线 → 2.点击「导入已锁定航线」加载任务")
 
 st.markdown("---")
-st.caption("操作说明：绘制障碍物多边形→设置建筑高度→生成左/右/最优3套航线，算法逐栋绕行连续建筑群，航线全程处于蓝色安全缓冲区外侧，不会穿墙")
+st.caption("操作说明：左侧地图使用多边形工具圈选建筑物障碍物→设置建筑高度保存→生成左/右/最优绕行航线，地图蓝色虚线为无人机规划航线，全程保持安全缓冲距离不触碰红色建筑区域，支持飞行仿真实时监控航点、速度、电量、剩余时长等全部指标")
